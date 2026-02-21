@@ -1,0 +1,557 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>wizrad outer loop prototype</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.0/p5.min.js"></script>
+  <style>
+    html, body { margin: 0; padding: 0; background: #0e1116; color: #e6e6e6; font-family: monospace; }
+    canvas { display: block; }
+  </style>
+</head>
+<body>
+<script>
+"use strict";
+
+const WORLD_W = 2600;
+const WORLD_H = 1700;
+const TERRAIN_SCALE = 0.0028;
+const DANGER_SCALE = 0.0045;
+const SEA_LEVEL = 0.5;
+const BEACH_BAND = 0.035;
+const GRID_CELL = 90;
+const GRID_JITTER = 0.34;
+const ROAD_NEIGHBORS = 3;
+const PLAYER_SPEED = 160;
+const ENCOUNTER_RATE = 0.2; // chance per second at max danger while traveling
+const CAMERA_ZOOM = 3.45;
+const TERRAIN_TILE = 2;
+
+const SPELL_POOL = [
+  "Missile", "Pulse", "Fireball", "Healing", "Homing", "Water",
+  "ConeFlames", "Barrage", "Lifesteal", "Firestorm"
+];
+
+const NAME_A = ["Bel", "Dor", "Fen", "Kor", "Tal", "Mor", "Ash", "Rin", "Var", "Lum"];
+const NAME_B = ["a", "e", "i", "o", "u", "an", "or", "el", "ir", "un"];
+const NAME_C = ["ford", "haven", "watch", "crest", "gard", "mere", "hold", "spire", "port", "vale"];
+const TOWN_TIERS = [
+  { tier: "hamlet", emoji: "🏚️", minPop: 40, maxPop: 180 },
+  { tier: "village", emoji: "🏘️", minPop: 180, maxPop: 700 },
+  { tier: "town", emoji: "🏠", minPop: 700, maxPop: 2200 },
+  { tier: "city", emoji: "🏰", minPop: 2200, maxPop: 8000 }
+];
+
+const state = {
+  terrainSeed: 0,
+  dangerSeed: 0,
+  terrainLayer: null,
+  towns: [],
+  edges: [],
+  edgeSet: new Set(),
+  player: null,
+  uiButtons: [],
+  message: "",
+  messageTimer: 0,
+  encountersEnabled: true
+};
+
+function makeTownName() {
+  return random(NAME_A) + random(NAME_B) + random(NAME_C);
+}
+
+function terrainHeightAt(x, y) {
+  const n = noise(x * TERRAIN_SCALE + state.terrainSeed, y * TERRAIN_SCALE + state.terrainSeed * 0.7);
+  const ridge = noise(x * TERRAIN_SCALE * 0.6 + 300, y * TERRAIN_SCALE * 0.6 + 900);
+  return constrain(n * 0.75 + ridge * 0.25, 0, 1);
+}
+
+function dangerAt(x, y) {
+  return noise(x * DANGER_SCALE + state.dangerSeed, y * DANGER_SCALE + state.dangerSeed * 1.17);
+}
+
+function isLand(x, y) {
+  return terrainHeightAt(x, y) >= SEA_LEVEL;
+}
+
+function getCamera() {
+  const base = min(width / WORLD_W, height / WORLD_H) * 0.95;
+  const scale = base * CAMERA_ZOOM;
+  const px = state.player ? state.player.x : WORLD_W * 0.5;
+  const py = state.player ? state.player.y : WORLD_H * 0.5;
+  const halfViewW = width * 0.5 / scale;
+  const halfViewH = height * 0.5 / scale;
+
+  // Clamp camera so the viewport never shows outside-world black void.
+  const cx = (halfViewW * 2 >= WORLD_W) ? WORLD_W * 0.5 : constrain(px, halfViewW, WORLD_W - halfViewW);
+  const cy = (halfViewH * 2 >= WORLD_H) ? WORLD_H * 0.5 : constrain(py, halfViewH, WORLD_H - halfViewH);
+  return { scale, cx, cy };
+}
+
+function worldToScreen(x, y) {
+  const cam = getCamera();
+  return {
+    x: width * 0.5 + (x - cam.cx) * cam.scale,
+    y: height * 0.5 + (y - cam.cy) * cam.scale
+  };
+}
+
+function screenToWorld(sx, sy) {
+  const cam = getCamera();
+  return {
+    x: cam.cx + (sx - width * 0.5) / cam.scale,
+    y: cam.cy + (sy - height * 0.5) / cam.scale
+  };
+}
+
+function makeTerrainLayer() {
+  const g = createGraphics(WORLD_W, WORLD_H);
+  g.noStroke();
+  for (let y = 0; y < WORLD_H; y += TERRAIN_TILE) {
+    for (let x = 0; x < WORLD_W; x += TERRAIN_TILE) {
+      const h = terrainHeightAt(x, y);
+      if (h < SEA_LEVEL) {
+        g.fill(20, 35 + h * 20, 110 + h * 70);
+      } else if (h < SEA_LEVEL + BEACH_BAND) {
+        g.fill(214, 194, 132);
+      } else if (h < 0.8) {
+        const t = map(h, SEA_LEVEL + BEACH_BAND, 0.8, 0, 1, true);
+        g.fill(48 + t * 26, 124 + t * 46, 56 + t * 20);
+      } else if (h < 0.92) {
+        const t = map(h, 0.8, 0.92, 0, 1, true);
+        g.fill(112 + t * 36, 112 + t * 36, 112 + t * 36);
+      } else {
+        const t = map(h, 0.92, 1, 0, 1, true);
+        g.fill(230 + t * 22, 230 + t * 22, 236 + t * 19);
+      }
+      g.rect(x, y, TERRAIN_TILE, TERRAIN_TILE);
+    }
+  }
+  return g;
+}
+
+function makeTownMeta() {
+  const roll = random();
+  let chosen = TOWN_TIERS[0];
+  if (roll > 0.9) chosen = TOWN_TIERS[3];
+  else if (roll > 0.68) chosen = TOWN_TIERS[2];
+  else if (roll > 0.35) chosen = TOWN_TIERS[1];
+  return {
+    sizeTier: chosen.tier,
+    emoji: chosen.emoji,
+    population: floor(random(chosen.minPop, chosen.maxPop))
+  };
+}
+
+function lineLandFraction(a, b) {
+  const samples = 18;
+  let landCount = 0;
+  for (let i = 0; i <= samples; i++) {
+    const t = i / samples;
+    const x = lerp(a.x, b.x, t);
+    const y = lerp(a.y, b.y, t);
+    if (isLand(x, y)) landCount++;
+  }
+  return landCount / (samples + 1);
+}
+
+function addEdge(i, j) {
+  if (i === j) return;
+  const a = min(i, j);
+  const b = max(i, j);
+  const key = `${a}|${b}`;
+  if (state.edgeSet.has(key)) return;
+  state.edgeSet.add(key);
+  state.edges.push({ a, b });
+}
+
+function generateMap() {
+  noiseSeed(floor(random(1e9)));
+  randomSeed(floor(random(1e9)));
+  state.terrainSeed = random(10, 5000);
+  state.dangerSeed = random(20, 7000);
+  state.towns = [];
+  state.edges = [];
+  state.edgeSet.clear();
+
+  for (let gy = 0; gy * GRID_CELL < WORLD_H; gy++) {
+    for (let gx = 0; gx * GRID_CELL < WORLD_W; gx++) {
+      const jx = (random() - 0.5) * GRID_CELL * GRID_JITTER * 2;
+      const jy = (random() - 0.5) * GRID_CELL * GRID_JITTER * 2;
+      const x = gx * GRID_CELL + GRID_CELL * 0.5 + jx;
+      const y = gy * GRID_CELL + GRID_CELL * 0.5 + jy;
+      if (x < 8 || y < 8 || x > WORLD_W - 8 || y > WORLD_H - 8) continue;
+      if (!isLand(x, y)) continue;
+      const meta = makeTownMeta();
+      state.towns.push({
+        id: state.towns.length,
+        x,
+        y,
+        gx,
+        gy,
+        name: makeTownName(),
+        sizeTier: meta.sizeTier,
+        emoji: meta.emoji,
+        population: meta.population,
+        visited: false,
+        shopSpell: null
+      });
+    }
+  }
+
+  for (let i = 0; i < state.towns.length; i++) {
+    const a = state.towns[i];
+    const sorted = [];
+    for (let j = 0; j < state.towns.length; j++) {
+      if (i === j) continue;
+      const b = state.towns[j];
+      const cellDx = abs(a.gx - b.gx);
+      const cellDy = abs(a.gy - b.gy);
+      if (cellDx > 1 || cellDy > 1) continue; // only adjacent Voronoi cells can road-link
+      sorted.push({ j, d: dist(a.x, a.y, b.x, b.y) });
+    }
+    sorted.sort((u, v) => u.d - v.d);
+    for (let n = 0; n < min(ROAD_NEIGHBORS, sorted.length); n++) {
+      const j = sorted[n].j;
+      const b = state.towns[j];
+      const landFrac = lineLandFraction(a, b);
+      if (landFrac >= 0.65) addEdge(i, j);
+    }
+  }
+
+  // Ensure no town is fully isolated.
+  for (let i = 0; i < state.towns.length; i++) {
+    const connected = state.edges.some((e) => e.a === i || e.b === i);
+    if (connected) continue;
+    let best = -1;
+    let bestD = Infinity;
+    for (let j = 0; j < state.towns.length; j++) {
+      if (i === j) continue;
+      const a = state.towns[i];
+      const b = state.towns[j];
+      if (abs(a.gx - b.gx) > 2 || abs(a.gy - b.gy) > 2) continue;
+      const d = dist(a.x, a.y, b.x, b.y);
+      if (d < bestD && lineLandFraction(state.towns[i], state.towns[j]) >= 0.55) {
+        bestD = d;
+        best = j;
+      }
+    }
+    if (best >= 0) addEdge(i, best);
+  }
+
+  state.terrainLayer = makeTerrainLayer();
+  initPlayer();
+}
+
+function initPlayer() {
+  if (state.towns.length < 2) {
+    state.player = null;
+    return;
+  }
+  let startIdx = 0;
+  let bestD = Infinity;
+  const cx = WORLD_W * 0.5;
+  const cy = WORLD_H * 0.5;
+  for (let i = 0; i < state.towns.length; i++) {
+    const t = state.towns[i];
+    const d = dist(t.x, t.y, cx, cy);
+    if (d < bestD) {
+      bestD = d;
+      startIdx = i;
+    }
+  }
+
+  state.towns[startIdx].visited = true;
+  state.player = {
+    atTown: startIdx,
+    targetTown: null,
+    progress: 0,
+    x: state.towns[startIdx].x,
+    y: state.towns[startIdx].y,
+    gold: 60,
+    mana: 70,
+    manaMax: 100,
+    potions: 1,
+    spells: ["Missile"]
+  };
+  prepareTownShop(startIdx);
+  setMessage(`Start at ${state.towns[startIdx].name}.`);
+}
+
+function setMessage(msg) {
+  state.message = msg;
+  state.messageTimer = 3.2;
+}
+
+function neighborsOf(townId) {
+  const out = [];
+  for (const e of state.edges) {
+    if (e.a === townId) out.push(e.b);
+    else if (e.b === townId) out.push(e.a);
+  }
+  return out;
+}
+
+function prepareTownShop(townId) {
+  const town = state.towns[townId];
+  const candidates = SPELL_POOL.filter((s) => !state.player.spells.includes(s));
+  town.shopSpell = candidates.length ? random(candidates) : null;
+}
+
+function startTravel(targetTownId) {
+  if (!state.player || state.player.targetTown != null) return;
+  const from = state.player.atTown;
+  const nbs = neighborsOf(from);
+  if (!nbs.includes(targetTownId)) return;
+  state.player.targetTown = targetTownId;
+  state.player.progress = 0;
+}
+
+function arriveTown() {
+  const p = state.player;
+  const town = state.towns[p.atTown];
+  town.visited = true;
+  prepareTownShop(p.atTown);
+  setMessage(`Arrived at ${town.name}. Shop is open.`);
+}
+
+function updateTravel(dt) {
+  const p = state.player;
+  if (!p || p.targetTown == null) return;
+  const a = state.towns[p.atTown];
+  const b = state.towns[p.targetTown];
+  const d = max(1, dist(a.x, a.y, b.x, b.y));
+  p.progress += (PLAYER_SPEED * dt) / d;
+
+  const t = constrain(p.progress, 0, 1);
+  p.x = lerp(a.x, b.x, t);
+  p.y = lerp(a.y, b.y, t);
+
+  if (state.encountersEnabled) {
+    const danger = dangerAt(p.x, p.y);
+    if (random() < ENCOUNTER_RATE * danger * dt) {
+      setMessage(`Encounter! (danger ${(danger * 100).toFixed(0)}%)`);
+      p.gold = max(0, p.gold - 2);
+    }
+  }
+
+  if (p.progress >= 1) {
+    p.atTown = p.targetTown;
+    p.targetTown = null;
+    p.progress = 0;
+    p.x = b.x;
+    p.y = b.y;
+    arriveTown();
+  }
+}
+
+function drawWorld() {
+  background(10, 14, 18);
+  const cam = getCamera();
+
+  push();
+  translate(width * 0.5, height * 0.5);
+  scale(cam.scale);
+  translate(-cam.cx, -cam.cy);
+  image(state.terrainLayer, 0, 0, WORLD_W, WORLD_H);
+
+  // Roads
+  strokeWeight(2 / cam.scale);
+  const playerTown = state.player ? state.player.atTown : -1;
+  for (const e of state.edges) {
+    const a = state.towns[e.a];
+    const b = state.towns[e.b];
+    const connectedToCurrent = e.a === playerTown || e.b === playerTown;
+    stroke(connectedToCurrent ? color(175, 136, 82, 240) : color(102, 84, 58, 95));
+    line(a.x, a.y, b.x, b.y);
+  }
+
+  // Town nodes and labels
+  textAlign(CENTER, CENTER);
+  for (const town of state.towns) {
+    const isAtTown = state.player && town.id === state.player.atTown;
+    noStroke();
+    fill(town.visited ? color(255, 236, 186, 180) : color(220, 205, 185, 135));
+    circle(town.x, town.y, 16 / cam.scale);
+    if (isAtTown) {
+      stroke(255, 228, 100);
+      strokeWeight(3 / cam.scale);
+      noFill();
+      circle(town.x, town.y, (26 + sin(frameCount * 0.12) * 2.5) / cam.scale);
+    }
+  }
+
+  pop();
+
+  // Draw emojis and labels in screen-space for reliable size.
+  textAlign(CENTER, CENTER);
+  for (const town of state.towns) {
+    const s = worldToScreen(town.x, town.y);
+    noStroke();
+    textSize(72);
+    text(town.emoji, s.x, s.y - 6);
+    fill(15);
+    textSize(13);
+    text(town.name, s.x, s.y + 18);
+    if (state.player && town.id === state.player.atTown && state.player.targetTown == null) {
+      fill(255, 245, 145);
+      textSize(12);
+      text("YOU ARE HERE", s.x, s.y - 32);
+    }
+  }
+
+  if (state.player) {
+    const ps = worldToScreen(state.player.x, state.player.y);
+    noStroke();
+    textSize(56);
+    text("🧙", ps.x, ps.y - 34);
+  }
+}
+
+function drawHud() {
+  if (!state.player) return;
+  const p = state.player;
+  const at = state.towns[p.atTown];
+  const d = dangerAt(p.x, p.y);
+
+  noStroke();
+  fill(0, 170);
+  rect(12, 12, 360, 150, 8);
+  fill(240);
+  textAlign(LEFT, TOP);
+  textSize(14);
+  text("Outer Loop Prototype", 22, 22);
+  text(`Town: ${at.name} (${at.sizeTier}, pop ${at.population})${p.targetTown != null ? " (traveling)" : ""}`, 22, 44);
+  text(`Gold: ${p.gold}   Mana: ${p.mana}/${p.manaMax}   Potions: ${p.potions}`, 22, 64);
+  text(`Danger: ${(d * 100).toFixed(0)}%   Encounters: ${state.encountersEnabled ? "ON" : "OFF"}`, 22, 84);
+  text("Click connected town to travel | P use potion | E toggle encounters | R regenerate", 22, 106, 340);
+
+  if (state.messageTimer > 0) {
+    fill(30, 25, 55, 220);
+    rect(12, height - 74, 460, 54, 8);
+    fill(240);
+    textSize(16);
+    text(state.message, 24, height - 60);
+  }
+
+  drawShopPanel();
+}
+
+function drawShopPanel() {
+  state.uiButtons = [];
+  const p = state.player;
+  if (!p || p.targetTown != null) return;
+  const town = state.towns[p.atTown];
+  const x = width - 280;
+  const y = 14;
+  const w = 266;
+  const h = 176;
+
+  fill(0, 170);
+  noStroke();
+  rect(x, y, w, h, 8);
+  fill(245);
+  textSize(14);
+  textAlign(LEFT, TOP);
+  text(`Shop at ${town.emoji} ${town.name}`, x + 10, y + 10);
+  text("Mana Potion (+35 mana) - 12g", x + 10, y + 38);
+  text(`Spell: ${town.shopSpell || "(sold out)"}`, x + 10, y + 78);
+  text("Buy spell - 24g", x + 10, y + 98);
+
+  const b1 = { x: x + 172, y: y + 34, w: 82, h: 24, kind: "potion" };
+  const b2 = { x: x + 172, y: y + 94, w: 82, h: 24, kind: "spell" };
+  drawButton(b1, "Buy");
+  drawButton(b2, "Buy");
+  state.uiButtons.push(b1, b2);
+}
+
+function drawButton(b, label) {
+  fill(68, 86, 110);
+  rect(b.x, b.y, b.w, b.h, 6);
+  fill(240);
+  textAlign(CENTER, CENTER);
+  text(label, b.x + b.w * 0.5, b.y + b.h * 0.5);
+}
+
+function tryBuy(kind) {
+  const p = state.player;
+  const town = state.towns[p.atTown];
+  if (kind === "potion") {
+    if (p.gold < 12) return setMessage("Not enough gold.");
+    p.gold -= 12;
+    p.potions += 1;
+    return setMessage("Bought 1 mana potion.");
+  }
+
+  if (kind === "spell") {
+    if (!town.shopSpell) return setMessage("No spell available.");
+    if (p.gold < 24) return setMessage("Not enough gold.");
+    p.gold -= 24;
+    p.spells.push(town.shopSpell);
+    setMessage(`Learned ${town.shopSpell}.`);
+    town.shopSpell = null;
+  }
+}
+
+function onWorldClick(mx, my) {
+  const p = state.player;
+  if (!p || p.targetTown != null) return;
+  const w = screenToWorld(mx, my);
+  const nbs = neighborsOf(p.atTown);
+  let best = null;
+  let bestD = 99999;
+  for (const id of nbs) {
+    const t = state.towns[id];
+    const d = dist(w.x, w.y, t.x, t.y);
+    if (d < bestD) {
+      bestD = d;
+      best = id;
+    }
+  }
+  if (best != null && bestD <= 26) startTravel(best);
+}
+
+function setup() {
+  createCanvas(windowWidth, windowHeight);
+  generateMap();
+}
+
+function draw() {
+  const dt = min(deltaTime / 1000, 0.05);
+  if (state.player) updateTravel(dt);
+  if (state.messageTimer > 0) state.messageTimer -= dt;
+  drawWorld();
+  drawHud();
+}
+
+function mousePressed() {
+  for (const b of state.uiButtons) {
+    const inside = mouseX >= b.x && mouseX <= b.x + b.w && mouseY >= b.y && mouseY <= b.y + b.h;
+    if (inside) {
+      tryBuy(b.kind);
+      return;
+    }
+  }
+  onWorldClick(mouseX, mouseY);
+}
+
+function keyPressed() {
+  const k = key.toLowerCase();
+  if (k === "r") generateMap();
+  else if (k === "p" && state.player && state.player.potions > 0) {
+    state.player.potions -= 1;
+    state.player.mana = min(state.player.manaMax, state.player.mana + 35);
+    setMessage("Used mana potion.");
+  } else if (k === "e") {
+    state.encountersEnabled = !state.encountersEnabled;
+    setMessage(`Encounters ${state.encountersEnabled ? "enabled" : "disabled"}.`);
+  }
+}
+
+function windowResized() {
+  resizeCanvas(windowWidth, windowHeight);
+}
+</script>
+</body>
+</html>

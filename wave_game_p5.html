@@ -1,0 +1,1050 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>wizrad wave game - p5.js port</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.0/p5.min.js"></script>
+  <style>
+    html, body { margin: 0; padding: 0; background: #111; color: #eee; font-family: monospace; }
+    canvas { display: block; }
+  </style>
+</head>
+<body>
+<script>
+"use strict";
+
+const TEAM_PLAYER = 0;
+const TEAM_ENEMIES = 1;
+const INVUL_TIME = 0.2;
+const INVUL_DAMAGE_THRESHOLD = 10.0;
+const LOOK_STRENGTH = 0.2;
+const DEFAULT_ZOOM = 34.0;
+const MIN_ZOOM = 16.0;
+const MAX_ZOOM = 64.0;
+const LEVEL_SIZE = 40.0;
+const PLAYER_SPAWN_Y = LEVEL_SIZE * 0.5 - 2.0;
+const ENEMY_SPAWN_Y = -LEVEL_SIZE * 0.5 + 2.0;
+
+const SPELL = {
+  MISSILE: "Missile",
+  PULSE: "Pulse",
+  LIFESTEAL: "Lifesteal",
+  SUMMON_BLOODCASTERS: "SummonBloodcasters",
+  CONE_FLAMES: "ConeFlames",
+  SUMMON_RUSHERS: "SummonRushers",
+  SUMMON_SUMMONERS: "SummonSummoners",
+  FIREBALL: "Fireball",
+  FIRESTORM: "Firestorm",
+  WATER: "Water",
+  HEALING: "Healing",
+  HOMING: "Homing",
+  BARRAGE: "Barrage",
+};
+
+const SPELL_POOL = [
+  SPELL.MISSILE, SPELL.FIREBALL, SPELL.CONE_FLAMES, SPELL.PULSE, SPELL.FIRESTORM,
+  SPELL.LIFESTEAL, SPELL.SUMMON_BLOODCASTERS, SPELL.SUMMON_RUSHERS, SPELL.HOMING, SPELL.HEALING,
+  SPELL.WATER, SPELL.BARRAGE, SPELL.SUMMON_SUMMONERS,
+];
+
+let game = null;
+let zoom = DEFAULT_ZOOM;
+const input = {
+  heldKeys: new Set(),
+  keyDownEvents: new Set(),
+  heldLMB: false,
+  lmbDown: false,
+  lmbUp: false,
+};
+
+function v(x = 0, y = 0) { return { x, y }; }
+function vAdd(a, b) { return v(a.x + b.x, a.y + b.y); }
+function vSub(a, b) { return v(a.x - b.x, a.y - b.y); }
+function vMul(a, s) { return v(a.x * s, a.y * s); }
+function vLen(a) { return Math.hypot(a.x, a.y); }
+function vNorm(a) { const l = vLen(a); return l > 1e-6 ? vMul(a, 1 / l) : v(0, 0); }
+function vDist(a, b) { return vLen(vSub(a, b)); }
+function vRot(a, r) {
+  const c = Math.cos(r), s = Math.sin(r);
+  return v(a.x * c - a.y * s, a.x * s + a.y * c);
+}
+function rand(a, b) { return a + Math.random() * (b - a); }
+
+function rectSides(e) {
+  return {
+    left: e.x - e.w / 2, right: e.x + e.w / 2,
+    top: e.y - e.h / 2, bot: e.y + e.h / 2,
+  };
+}
+
+function overlapAmount(a1, a2, b1, b2) {
+  const a1InB = a1 >= b1 && a1 <= b2;
+  const a2InB = a2 >= b1 && a2 <= b2;
+  const b1InA = b1 >= a1 && b1 <= a2;
+  const b2InA = b2 >= a1 && b2 <= a2;
+  const aLeft = (a1 + a2) < (b1 + b2);
+  if (!a1InB && !a2InB && !b1InA && !b2InA) return 0;
+  if (a1InB && a2InB && aLeft) return a2 - b1;
+  if (a1InB && a2InB && !aLeft) return b2 - a1;
+  if (b1InA && b2InA && aLeft) return a2 - b1;
+  if (b1InA && b2InA && !aLeft) return b2 - a1;
+  if (a1InB) return b2 - a1;
+  if (b1InA) return -(a2 - b1);
+  return 0;
+}
+
+function collideRects(a, b) {
+  const ra = rectSides(a), rb = rectSides(b);
+  const xo = overlapAmount(ra.left, ra.right, rb.left, rb.right);
+  const yo = overlapAmount(ra.top, ra.bot, rb.top, rb.bot);
+  if (xo === 0 || yo === 0) return null;
+  return Math.abs(xo) < Math.abs(yo) ? v(xo, 0) : v(0, yo);
+}
+
+function shuffle(arr) {
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    const t = arr[i]; arr[i] = arr[j]; arr[j] = t;
+  }
+}
+
+function makeBaseEntity() {
+  return {
+    id: -1,
+    x: 0, y: 0, w: 1, h: 1,
+    vx: 0, vy: 0, oldX: 0, oldY: 0,
+    mass: 1.0,
+    team: null,
+    player: null,
+    ai: null,
+    aiCaster: null,
+    health: null,
+    caster: null,
+    projectile: null,
+    meleeDamage: null,
+    expiry: null,
+    emitter: null,
+    spawnList: null,
+    makeOnDeath: null,
+    color: [255, 255, 255],
+    lastHitBy: null,
+  };
+}
+
+function makePlayer(pos) {
+  const e = makeBaseEntity();
+  e.x = pos.x; e.y = pos.y; e.w = 1.0; e.h = 1.0;
+  e.mass = 1.0; e.team = TEAM_PLAYER;
+  e.player = { speed: 10.0, spellbook: [], spellCursor: 0, kills: 0 };
+  e.caster = { manaMax: 100, mana: 100, manaRegen: 30, lastCast: -10000 };
+  e.health = { max: 100, current: 100, regen: 1, invulTime: -1 };
+  e.color = [255, 60, 255];
+  return e;
+}
+
+function makeZerg(pos, team) {
+  const e = makeBaseEntity();
+  e.x = pos.x; e.y = pos.y; e.w = 0.5; e.h = 0.5;
+  e.mass = 0.25; e.team = team;
+  e.meleeDamage = { amount: 20 };
+  e.health = { max: 20, current: 20, regen: 1, invulTime: -1 };
+  e.ai = { dir: v(0, 0), acquisitionRange: 10, fleeRange: 0, speed: 7, accel: 6 };
+  e.color = [170, 20, 20];
+  return e;
+}
+
+function makeSummoner(pos, team) {
+  const e = makeBaseEntity();
+  e.x = pos.x; e.y = pos.y; e.w = 1.2; e.h = 1.2;
+  e.mass = 2.0; e.team = team;
+  e.health = { max: 100, current: 100, regen: 1, invulTime: -1 };
+  e.ai = { dir: v(0, 0), acquisitionRange: 10, fleeRange: 0, speed: 2, accel: 6 };
+  e.aiCaster = { spell: SPELL.SUMMON_RUSHERS, acquisitionRange: 10, rising: false, unleasher: false };
+  e.caster = { manaMax: 20, mana: 20, manaRegen: 2, lastCast: -10000 };
+  e.color = [130, 20, 20];
+  return e;
+}
+
+function makeSummonerSummoner(pos, team) {
+  const e = makeBaseEntity();
+  e.x = pos.x; e.y = pos.y; e.w = 1.8; e.h = 1.8;
+  e.mass = 4.0; e.team = team;
+  e.health = { max: 200, current: 200, regen: 1, invulTime: -1 };
+  e.ai = { dir: v(0, 0), acquisitionRange: 10, fleeRange: 0, speed: 1.6, accel: 6 };
+  e.aiCaster = { spell: SPELL.SUMMON_SUMMONERS, acquisitionRange: 12, rising: false, unleasher: false };
+  e.caster = { manaMax: 100, mana: 100, manaRegen: 3, lastCast: -10000 };
+  e.color = [80, 10, 10];
+  return e;
+}
+
+function makeMagicMissileCaster(pos, team) {
+  const e = makeBaseEntity();
+  e.x = pos.x; e.y = pos.y; e.w = 0.9; e.h = 0.9;
+  e.mass = 0.7; e.team = team;
+  e.health = { max: 20, current: 20, regen: 1, invulTime: -1 };
+  e.ai = { dir: v(0, 0), acquisitionRange: 10, fleeRange: 5, speed: 3, accel: 6 };
+  e.aiCaster = { spell: SPELL.MISSILE, acquisitionRange: 9, rising: false, unleasher: false };
+  e.caster = { manaMax: 10, mana: 10, manaRegen: 3, lastCast: -10000 };
+  e.color = [50, 190, 190];
+  return e;
+}
+
+function makeBloodcaster(pos, team) {
+  const e = makeBaseEntity();
+  e.x = pos.x; e.y = pos.y; e.w = 0.9; e.h = 0.9;
+  e.mass = 0.7; e.team = team;
+  e.health = { max: 40, current: 40, regen: 1, invulTime: -1 };
+  e.ai = { dir: v(0, 0), acquisitionRange: 10, fleeRange: 5, speed: 5, accel: 6 };
+  e.aiCaster = { spell: SPELL.LIFESTEAL, acquisitionRange: 7, rising: false, unleasher: false };
+  e.caster = { manaMax: 0, mana: 0, manaRegen: 0, lastCast: -10000 };
+  e.color = [105, 75, 75];
+  return e;
+}
+
+function makeBarrager(pos, team) {
+  const e = makeBaseEntity();
+  e.x = pos.x; e.y = pos.y; e.w = 1.2; e.h = 1.2;
+  e.mass = 2.0; e.team = team;
+  e.health = { max: 60, current: 60, regen: 1, invulTime: -1 };
+  e.ai = { dir: v(0, 0), acquisitionRange: 20, fleeRange: 10, speed: 3, accel: 6 };
+  e.aiCaster = { spell: SPELL.BARRAGE, acquisitionRange: 15, rising: false, unleasher: true };
+  e.caster = { manaMax: 50, mana: 50, manaRegen: 6, lastCast: -10000 };
+  e.color = [150, 20, 200];
+  return e;
+}
+
+function spawnListBuilder() {
+  return { t: 0, list: [], cursor: 0, timeCursor: 0 };
+}
+function spawnListSpawn(builder, makeFn) {
+  builder.list.push({ t: builder.timeCursor, makeFn });
+}
+function spawnListWait(builder, dt) {
+  builder.timeCursor += dt;
+}
+function makePortal2(pos, team) {
+  const e = makeBaseEntity();
+  e.x = pos.x; e.y = pos.y; e.w = 1.0; e.h = 2.0;
+  e.color = [210, 0, 255];
+  const s = spawnListBuilder();
+  for (let i = 0; i <= 40; i++) {
+    if (i % 2 === 0) spawnListSpawn(s, () => makeMagicMissileCaster(v(pos.x, pos.y), team));
+    spawnListSpawn(s, () => makeZerg(v(pos.x, pos.y), team));
+    spawnListWait(s, 0.5);
+  }
+  e.spawnList = s;
+  return e;
+}
+function makePortal3(pos, team) {
+  const e = makeBaseEntity();
+  e.x = pos.x; e.y = pos.y; e.w = 1.0; e.h = 2.0;
+  e.color = [220, 20, 20];
+  const s = spawnListBuilder();
+  for (let i = 0; i <= 40; i++) {
+    if (i % 4 === 0) spawnListSpawn(s, () => makeSummoner(v(pos.x, pos.y), team));
+    if (i % 10 === 0) {
+      spawnListSpawn(s, () => makeSummonerSummoner(v(pos.x, pos.y), team));
+      spawnListSpawn(s, () => makeBarrager(v(pos.x, pos.y), team));
+    }
+    spawnListWait(s, 0.75);
+  }
+  e.spawnList = s;
+  return e;
+}
+
+function addEntity(e) {
+  e.id = game.nextId++;
+  game.entities.set(e.id, e);
+  if (e.player) game.playerId = e.id;
+  return e.id;
+}
+
+function removeEntity(id) {
+  if (!game.entities.has(id)) return;
+  if (id === game.playerId) game.playerId = null;
+  game.entities.delete(id);
+}
+
+function createGame() {
+  const g = {
+    t: 0,
+    wave: 0,
+    pause: false,
+    lookCenter: v(0, 0),
+    entities: new Map(),
+    nextId: 1,
+    playerId: null,
+    spellMenu: null,
+    particles: [],
+    events: [],
+  };
+  game = g;
+  zoom = DEFAULT_ZOOM;
+  addEntity(makePlayer(v(0, PLAYER_SPAWN_Y)));
+
+  game.events.push({
+    cond: () => playerSpellbook().length === 0,
+    eff: () => openSpellMenu(),
+  });
+  game.events.push({
+    cond: () => playerSpellbook().length === 1,
+    eff: () => openSpellMenu(),
+  });
+  game.events.push({
+    cond: () => playerSpellbook().length === 2,
+    eff: () => { addEntity(makePortal3(v(0, ENEMY_SPAWN_Y), TEAM_ENEMIES)); game.wave = 1; },
+  });
+  game.events.push({
+    cond: () => {
+      const spawnEntity = Array.from(game.entities.values()).find((e) => e.spawnList);
+      if (!spawnEntity) return false;
+      const nEnemies = Array.from(game.entities.values()).filter((e) => e.team === TEAM_ENEMIES).length;
+      const lastT = spawnEntity.spawnList.list[spawnEntity.spawnList.list.length - 1].t;
+      return game.wave === 1 && nEnemies === 0 && spawnEntity.spawnList.t > lastT;
+    },
+    eff: () => {
+      const spawnEntity = Array.from(game.entities.values()).find((e) => e.spawnList);
+      if (spawnEntity) removeEntity(spawnEntity.id);
+      addEntity(makePortal2(v(0, ENEMY_SPAWN_Y), TEAM_ENEMIES));
+      game.wave = 2;
+    },
+  });
+}
+
+function playerEntity() {
+  return game.playerId != null ? game.entities.get(game.playerId) : null;
+}
+function playerSpellbook() {
+  const p = playerEntity();
+  return p && p.player ? p.player.spellbook : [];
+}
+
+function openSpellMenu() {
+  const current = new Set(playerSpellbook());
+  const pool = SPELL_POOL.filter((s) => !current.has(s));
+  if (pool.length < 3) return;
+  shuffle(pool);
+  game.spellMenu = { choices: [pool[0], pool[1], pool[2]], clickAfter: game.t + 0.3 };
+}
+
+function cameraState() {
+  const viewW = width / zoom;
+  const viewH = height / zoom;
+  const lookVec = v((mouseX / width - 0.5) * viewW, (mouseY / height - 0.5) * viewH);
+  const cx = game.lookCenter.x + LOOK_STRENGTH * lookVec.x;
+  const cy = game.lookCenter.y + LOOK_STRENGTH * lookVec.y;
+  return { cx, cy, viewW, viewH };
+}
+
+function screenToWorld(px, py) {
+  const cam = cameraState();
+  return v(cam.cx + (px - width * 0.5) / zoom, cam.cy + (py - height * 0.5) / zoom);
+}
+
+function worldToScreen(wx, wy) {
+  const cam = cameraState();
+  return v((wx - cam.cx) * zoom + width * 0.5, (wy - cam.cy) * zoom + height * 0.5);
+}
+
+function damageEntity(targetId, amount, srcId) {
+  const e = game.entities.get(targetId);
+  if (!e || !e.health) return;
+  if (game.t - e.health.invulTime > INVUL_TIME) {
+    if (amount > INVUL_DAMAGE_THRESHOLD) e.health.invulTime = game.t;
+    e.health.current -= amount;
+    e.lastHitBy = srcId;
+  }
+}
+
+function addProjectile(team, source, pos, vel, size, damage, color, extra = {}) {
+  const e = makeBaseEntity();
+  e.team = team;
+  e.mass = extra.mass ?? 1.0;
+  e.x = pos.x; e.y = pos.y;
+  e.w = size; e.h = size;
+  e.vx = vel.x; e.vy = vel.y;
+  e.projectile = {
+    source,
+    damage,
+    aoe: extra.aoe ?? 0,
+    splatDuration: extra.splatDuration ?? 0,
+    lifestealPercent: extra.lifestealPercent ?? 0,
+    homing: extra.homing ?? false,
+  };
+  e.expiry = extra.expiry ?? null;
+  if (extra.emitter) {
+    e.emitter = {
+      interval: extra.emitter.interval,
+      last: game.t,
+      color: extra.emitter.color,
+      size: extra.emitter.size,
+      speed: extra.emitter.speed,
+      lifespan: extra.emitter.lifespan,
+    };
+  }
+  e.color = color;
+  addEntity(e);
+}
+
+function updateEmittersAndParticles(dt) {
+  for (const e of game.entities.values()) {
+    if (!e.emitter) continue;
+    let emitted = 0;
+    const maxBurst = 4;
+    while (e.emitter.last + e.emitter.interval < game.t && emitted < maxBurst) {
+      e.emitter.last += e.emitter.interval;
+      const d = vNorm(v(rand(-1, 1), rand(-1, 1)));
+      game.particles.push({
+        x: e.x,
+        y: e.y,
+        w: e.emitter.size,
+        h: e.emitter.size,
+        vx: d.x * e.emitter.speed,
+        vy: d.y * e.emitter.speed,
+        color: e.emitter.color,
+        expiry: e.emitter.last + e.emitter.lifespan,
+      });
+      emitted += 1;
+    }
+    if (e.emitter.last + e.emitter.interval < game.t) {
+      // Drop overdue emissions to prevent single-frame particle explosions.
+      e.emitter.last = game.t - e.emitter.interval;
+    }
+  }
+
+  const next = [];
+  for (const p of game.particles) {
+    if (p.expiry <= game.t) continue;
+    p.x += p.vx * dt;
+    p.y += p.vy * dt;
+    next.push(p);
+  }
+  game.particles = next;
+}
+
+function castSpell(casterId, target, spell, repeat, dt) {
+  const caster = game.entities.get(casterId);
+  if (!caster || !caster.caster || caster.team == null) return;
+  const cc = caster.caster;
+  const casterPos = v(caster.x, caster.y);
+  const team = caster.team;
+  const aim = vSub(target, casterPos);
+  const dir = vLen(aim) > 1e-6 ? vNorm(aim) : v(0, -1);
+
+  if (spell === SPELL.CONE_FLAMES) {
+    if (cc.mana >= 1.0) {
+      cc.mana -= 1.0;
+      for (let i = 0; i < 4; i++) {
+        const spray = rand(-0.25, 0.25);
+        const vel = vMul(vRot(dir, spray), 10.0);
+        addProjectile(team, casterId, casterPos, vel, 0.2, 2.0, [255, rand(50, 220), 10], { mass: 0, expiry: game.t + rand(0.6, 0.8) });
+      }
+    }
+    return;
+  }
+
+  if (spell === SPELL.BARRAGE) {
+    if (cc.lastCast + 0.1 > game.t) return;
+    cc.lastCast = game.t;
+    if (cc.mana >= 5.0) {
+      cc.mana -= 5.0;
+      addProjectile(team, casterId, casterPos, vMul(vRot(dir, rand(-0.6, 0.6)), 9.0), 0.5, 30.0, [210, 40, 210], {
+        mass: 10,
+        emitter: { interval: 0.05, color: [150, 0, 200], speed: 2.0, lifespan: 0.7, size: 0.1 },
+      });
+    }
+    return;
+  }
+
+  if (spell === SPELL.WATER) {
+    if (cc.mana >= 0.4) {
+      cc.mana -= 0.4;
+      for (let i = 0; i < 7; i++) {
+        const vel = vMul(vRot(dir, rand(-0.6, 0.6)), 6.0);
+        addProjectile(team, casterId, casterPos, vel, 0.2, 0.0, [40, 120, 255], { mass: 20, expiry: game.t + rand(0.6, 0.8) });
+      }
+    }
+    return;
+  }
+
+  if (spell === SPELL.MISSILE) {
+    if (repeat || cc.lastCast + 0.3 > game.t) return;
+    cc.lastCast = game.t;
+    if (cc.mana >= 10.0) {
+      cc.mana -= 10.0;
+      addProjectile(team, casterId, casterPos, vMul(dir, 15.0), 0.4, 34.0, [220, 10, 220], {
+        mass: 10,
+        emitter: { interval: 0.05, color: [200, 0, 200], speed: 2.0, lifespan: 0.7, size: 0.1 },
+      });
+    }
+    return;
+  }
+
+  if (spell === SPELL.HOMING) {
+    if (repeat || cc.lastCast + 0.3 > game.t) return;
+    cc.lastCast = game.t;
+    if (cc.mana >= 25.0) {
+      cc.mana -= 25.0;
+      addProjectile(team, casterId, casterPos, vMul(dir, 5.0), 0.5, 20.0, [20, 110, 255], {
+        mass: 10, homing: true,
+        emitter: { interval: 0.05, color: [0, 100, 255], speed: 2.0, lifespan: 0.7, size: 0.1 },
+      });
+      addProjectile(team, casterId, casterPos, vMul(vRot(dir, -1.0), 5.0), 0.5, 20.0, [20, 110, 255], {
+        mass: 10, homing: true,
+        emitter: { interval: 0.05, color: [0, 100, 255], speed: 2.0, lifespan: 0.7, size: 0.1 },
+      });
+      addProjectile(team, casterId, casterPos, vMul(vRot(dir, 1.0), 5.0), 0.5, 20.0, [20, 110, 255], {
+        mass: 10, homing: true,
+        emitter: { interval: 0.05, color: [0, 100, 255], speed: 2.0, lifespan: 0.7, size: 0.1 },
+      });
+    }
+    return;
+  }
+
+  if (spell === SPELL.PULSE) {
+    if (cc.lastCast + 0.1 > game.t) return;
+    cc.lastCast = game.t;
+    if (cc.mana >= 6.0) {
+      cc.mana -= 6.0;
+      addProjectile(team, casterId, casterPos, vMul(dir, 25.0), 0.4, 34.0, [20, 220, 20], {
+        mass: 4, expiry: game.t + (4.0 / 25.0),
+        emitter: { interval: 0.05, color: [0, 200, 0], speed: 3.0, lifespan: 0.3, size: 0.1 },
+      });
+    }
+    return;
+  }
+
+  if (spell === SPELL.LIFESTEAL) {
+    if (cc.lastCast + 0.5 > game.t) return;
+    cc.lastCast = game.t;
+    if (caster.health && caster.health.current >= 10.0) {
+      caster.health.current -= 10.0;
+      addProjectile(team, casterId, casterPos, vMul(dir, 10.0), 0.4, 20.0, [220, 30, 30], {
+        mass: 4, lifestealPercent: 0.7,
+        emitter: { interval: 0.05, color: [200, 0, 0], speed: 2.0, lifespan: 0.7, size: 0.1 },
+      });
+    }
+    return;
+  }
+
+  if (spell === SPELL.FIREBALL) {
+    if (repeat || cc.lastCast + 0.3 > game.t) return;
+    cc.lastCast = game.t;
+    if (cc.mana >= 30.0) {
+      cc.mana -= 30.0;
+      addProjectile(team, casterId, casterPos, vMul(dir, 10.0), 0.5, 50.0, [255, 40, 0], {
+        mass: 1, aoe: 4.0, splatDuration: 0.7, expiry: game.t + 10.0,
+        emitter: { interval: 0.2, color: [80, 80, 80], speed: 0.3, lifespan: 0.5, size: 0.15 },
+      });
+    }
+    return;
+  }
+
+  if (spell === SPELL.FIRESTORM) {
+    if (cc.lastCast + 0.25 > game.t) return;
+    cc.lastCast = game.t;
+    if (cc.mana >= 8.0) {
+      cc.mana -= 8.0;
+      addProjectile(team, casterId, casterPos, vMul(dir, 15.0), 0.5, 18.0, [255, 0, 0], {
+        mass: 4, aoe: 2.0,
+        emitter: { interval: 0.05, color: [255, 0, 0], speed: 2.0, lifespan: 0.7, size: 0.15 },
+      });
+    }
+    return;
+  }
+
+  if (spell === SPELL.SUMMON_RUSHERS) {
+    if (repeat || cc.lastCast + 0.3 > game.t) return;
+    cc.lastCast = game.t;
+    if (cc.mana >= 20.0) {
+      cc.mana -= 20.0;
+      addEntity(makeZerg(v(casterPos.x + 1.0, casterPos.y), team));
+      addEntity(makeZerg(v(casterPos.x - 0.5, casterPos.y + 0.86), team));
+      addEntity(makeZerg(v(casterPos.x - 0.5, casterPos.y - 0.86), team));
+    }
+    return;
+  }
+
+  if (spell === SPELL.SUMMON_BLOODCASTERS) {
+    if (repeat || cc.lastCast + 0.3 > game.t) return;
+    cc.lastCast = game.t;
+    if (caster.health && caster.health.current >= 50.0) {
+      caster.health.current -= 50.0;
+      addEntity(makeBloodcaster(v(casterPos.x + 1.0, casterPos.y), team));
+      addEntity(makeBloodcaster(v(casterPos.x - 1.0, casterPos.y), team));
+    }
+    return;
+  }
+
+  if (spell === SPELL.SUMMON_SUMMONERS) {
+    if (repeat || cc.lastCast + 0.3 > game.t) return;
+    cc.lastCast = game.t;
+    if (cc.mana >= 100.0) {
+      cc.mana -= 100.0;
+      addEntity(makeSummoner(v(casterPos.x + 2.0, casterPos.y), team));
+      addEntity(makeSummoner(v(casterPos.x - 1.0, casterPos.y + 1.73), team));
+      addEntity(makeSummoner(v(casterPos.x - 1.0, casterPos.y - 1.73), team));
+    }
+    return;
+  }
+
+  if (spell === SPELL.HEALING) {
+    if (caster.health && cc.mana >= 30.0 * dt) {
+      caster.health.current += 30.0 * dt;
+      caster.health.current = Math.min(caster.health.current, caster.health.max);
+      cc.mana -= 30.0 * dt;
+      cc.lastCast = game.t;
+    }
+  }
+}
+
+function updateMovementAI(dt) {
+  const ents = Array.from(game.entities.values());
+  for (const e of ents) {
+    if (!e.ai) continue;
+    const enemies = ents.filter((o) => o.id !== e.id && o.team != null && o.team !== e.team && !o.projectile);
+    let target = null;
+    let bestDist = Infinity;
+    for (const o of enemies) {
+      const d = vDist(v(e.x, e.y), v(o.x, o.y));
+      if (d < e.ai.acquisitionRange && d < bestDist) {
+        bestDist = d;
+        target = o;
+      }
+    }
+    if (target) {
+      let dir = vNorm(vSub(v(target.x, target.y), v(e.x, e.y)));
+      if (bestDist < e.ai.fleeRange) dir = vMul(dir, -1);
+      const speed = Math.min(e.ai.speed, bestDist / Math.max(dt, 1e-4));
+      const tv = vMul(dir, speed);
+      e.vx = e.vx + e.ai.accel * dt * (tv.x - e.vx);
+      e.vy = e.vy + e.ai.accel * dt * (tv.y - e.vy);
+      e.ai.dir = dir;
+    } else {
+      e.ai.dir = vNorm(vAdd(e.ai.dir, vMul(vNorm(v(rand(-1, 1), rand(-1, 1))), dt * 0.02)));
+      const nx = e.x + e.ai.dir.x * 1.0;
+      const ny = e.y + e.ai.dir.y * 1.0;
+      if (Math.abs(nx) > LEVEL_SIZE / 2) e.ai.dir.x *= -1;
+      if (Math.abs(ny) > LEVEL_SIZE / 2) e.ai.dir.y *= -1;
+      const tv = vMul(e.ai.dir, 0.25 * e.ai.speed);
+      e.vx = tv.x + e.ai.accel * dt * (tv.x - e.vx);
+      e.vy = tv.y + e.ai.accel * dt * (tv.y - e.vy);
+    }
+  }
+}
+
+function updateCastingAI(dt) {
+  const ents = Array.from(game.entities.values());
+  for (const e of ents) {
+    if (!e.aiCaster || !e.caster) continue;
+    if (e.aiCaster.unleasher) {
+      if (e.caster.mana >= e.caster.manaMax) e.aiCaster.rising = false;
+      if (e.caster.mana < 5.0) e.aiCaster.rising = true;
+      if (e.aiCaster.rising) continue;
+    }
+    let target = null;
+    let bestDist = Infinity;
+    for (const o of ents) {
+      if (o.id === e.id || o.team == null || o.team === e.team || o.projectile) continue;
+      const d = vDist(v(e.x, e.y), v(o.x, o.y));
+      if (d < e.aiCaster.acquisitionRange && d < bestDist) {
+        bestDist = d;
+        target = o;
+      }
+    }
+    if (target) castSpell(e.id, v(target.x, target.y), e.aiCaster.spell, false, dt);
+  }
+}
+
+function moveEntities(dt) {
+  for (const e of game.entities.values()) {
+    e.oldX = e.x; e.oldY = e.y;
+    e.x += e.vx * dt;
+    e.y += e.vy * dt;
+  }
+}
+
+function collisions() {
+  const phys = Array.from(game.entities.values()).filter((e) => Number.isFinite(e.vx) && Number.isFinite(e.vy));
+  const cols = [];
+  for (let i = 0; i < phys.length; i++) {
+    for (let j = 0; j < phys.length; j++) {
+      if (i === j) continue;
+      const a = phys[i], b = phys[j];
+      const pen = collideRects(a, b);
+      if (pen) cols.push({ subject: a.id, object: b.id, penetration: pen });
+    }
+  }
+  return cols;
+}
+
+function fixOverlaps(cols, proportion) {
+  for (const c of cols) {
+    const s = game.entities.get(c.subject), o = game.entities.get(c.object);
+    if (!s || !o) continue;
+    const omass = o.mass ?? 1;
+    const smass = s.mass ?? 1;
+    const sw = smass / Math.max(smass + omass, 1e-6);
+    s.x += (1.0 - sw) * c.penetration.x * proportion;
+    s.y += (1.0 - sw) * c.penetration.y * proportion;
+  }
+}
+
+function fixVelocities(dt) {
+  for (const e of game.entities.values()) {
+    e.vx = (e.x - e.oldX) / Math.max(dt, 1e-6);
+    e.vy = (e.y - e.oldY) / Math.max(dt, 1e-6);
+  }
+}
+
+function updateGame(dt) {
+  game.t += dt;
+  const p = playerEntity();
+  if (p) game.lookCenter = v(p.x, p.y);
+
+  const triggered = [];
+  for (let i = 0; i < game.events.length; i++) if (game.events[i].cond()) triggered.push(i);
+  for (const i of triggered) game.events[i].eff();
+  triggered.sort((a, b) => b - a);
+  for (const i of triggered) game.events.splice(i, 1);
+
+  if (input.keyDownEvents.has("p")) game.pause = !game.pause;
+  if (input.keyDownEvents.has("-")) zoom = Math.max(MIN_ZOOM, zoom - 2.0);
+  if (input.keyDownEvents.has("=")) zoom = Math.min(MAX_ZOOM, zoom + 2.0);
+  if (input.keyDownEvents.has("m")) {
+    for (const e of Array.from(game.entities.values())) if (e.team === TEAM_ENEMIES) removeEntity(e.id);
+  }
+  if (input.keyDownEvents.has("r")) createGame();
+  if (!playerEntity()) return;
+
+  if (game.spellMenu) {
+    if (input.lmbUp && game.t > game.spellMenu.clickAfter) {
+      const y = height * 0.5, h = 120, w = 180, gap = 25;
+      const left = width * 0.5 - (w * 3 + gap * 2) * 0.5;
+      for (let i = 0; i < 3; i++) {
+        const rx = left + i * (w + gap);
+        if (mouseX >= rx && mouseX <= rx + w && mouseY >= y - h / 2 && mouseY <= y + h / 2) {
+          const pe = playerEntity();
+          if (pe && pe.player) pe.player.spellbook.push(game.spellMenu.choices[i]);
+          game.spellMenu = null;
+          break;
+        }
+      }
+    }
+  } else if (!game.pause) {
+    const pe = playerEntity();
+    if (pe && pe.player && pe.caster) {
+      const mv = v(
+        (input.heldKeys.has("d") ? 1 : 0) - (input.heldKeys.has("a") ? 1 : 0),
+        (input.heldKeys.has("s") ? 1 : 0) - (input.heldKeys.has("w") ? 1 : 0)
+      );
+      const dir = vNorm(mv);
+      pe.vx = dir.x * pe.player.speed;
+      pe.vy = dir.y * pe.player.speed;
+      if (input.keyDownEvents.has("q")) {
+        pe.player.spellCursor = Math.max(0, pe.player.spellCursor - 1);
+        pe.caster.lastCast = 0;
+      }
+      if (input.keyDownEvents.has("e")) {
+        pe.player.spellCursor = Math.min(pe.player.spellbook.length - 1, pe.player.spellCursor + 1);
+        pe.caster.lastCast = 0;
+      }
+
+      const mouseWorld = screenToWorld(mouseX, mouseY);
+      const sp = pe.player.spellbook[pe.player.spellCursor];
+      if (sp) {
+        if (input.lmbDown) castSpell(pe.id, mouseWorld, sp, false, dt);
+        else if (input.heldLMB) castSpell(pe.id, mouseWorld, sp, true, dt);
+      }
+    }
+
+    if (pe && pe.player) {
+      const needMenu = (
+        pe.player.spellbook.length < 1 ||
+        (pe.player.kills > 10 && pe.player.spellbook.length < 2) ||
+        (pe.player.kills > 100 && pe.player.spellbook.length < 3) ||
+        (pe.player.kills > 300 && pe.player.spellbook.length < 4) ||
+        (pe.player.kills > 600 && pe.player.spellbook.length < 5)
+      );
+      if (needMenu && !game.spellMenu) openSpellMenu();
+    }
+
+    updateMovementAI(dt);
+    updateCastingAI(dt);
+    updateEmittersAndParticles(dt);
+
+    // Basic homing behavior mirrors the original "ai on projectile" intent.
+    for (const e of game.entities.values()) {
+      if (!e.projectile || !e.projectile.homing) continue;
+      const targets = Array.from(game.entities.values()).filter((o) => o.team != null && o.team !== e.team && !o.projectile);
+      let best = null, bestDist = Infinity;
+      for (const t of targets) {
+        const d = vDist(v(e.x, e.y), v(t.x, t.y));
+        if (d < bestDist) { bestDist = d; best = t; }
+      }
+      if (best) {
+        const cur = vNorm(v(e.vx, e.vy));
+        const want = vNorm(vSub(v(best.x, best.y), v(e.x, e.y)));
+        const blended = vNorm(vAdd(vMul(cur, 0.9), vMul(want, 0.1)));
+        const speed = Math.max(1, vLen(v(e.vx, e.vy)));
+        e.vx = blended.x * speed;
+        e.vy = blended.y * speed;
+      }
+    }
+
+    moveEntities(dt);
+    let cols = collisions();
+    cols = cols.filter((ce) => {
+      const s = game.entities.get(ce.subject), o = game.entities.get(ce.object);
+      if (!s || !o || s.team == null || o.team == null) return false;
+      const sproj = !!s.projectile, oproj = !!o.projectile;
+      if (s.team === o.team && (sproj || oproj)) return false;
+      if (sproj && oproj) return false;
+      return true;
+    });
+
+    const dead = new Set();
+    const damageEvents = [];
+    for (const ce of cols) {
+      const s = game.entities.get(ce.subject), o = game.entities.get(ce.object);
+      if (!s || !o || !s.projectile) continue;
+      const proj = s.projectile;
+      const impact = v(o.x, o.y);
+      if (proj.aoe > 0) {
+        for (const t of game.entities.values()) {
+          if (t.team == null || t.team === s.team || !t.health) continue;
+          if (vDist(v(t.x, t.y), impact) <= proj.aoe) damageEvents.push({ src: proj.source, target: t.id, amount: proj.damage });
+        }
+      } else if (o.health) {
+        damageEvents.push({ src: proj.source, target: o.id, amount: proj.damage });
+      }
+      if (proj.lifestealPercent > 0) {
+        const src = game.entities.get(proj.source);
+        if (src && src.health) src.health.current = Math.min(src.health.max, src.health.current + proj.lifestealPercent * proj.damage);
+      }
+      dead.add(s.id);
+    }
+
+    for (const ce of cols) {
+      const s = game.entities.get(ce.subject), o = game.entities.get(ce.object);
+      if (!s || !o || !s.meleeDamage || s.team == null || o.team == null || s.team === o.team) continue;
+      damageEvents.push({ src: s.id, target: o.id, amount: s.meleeDamage.amount });
+    }
+
+    for (const de of damageEvents) damageEntity(de.target, de.amount, de.src);
+
+    for (const e of game.entities.values()) if (e.expiry != null && e.expiry < game.t) dead.add(e.id);
+    for (const e of game.entities.values()) if (e.health && e.health.current <= 0) dead.add(e.id);
+
+    fixOverlaps(cols, 1.0);
+    for (const e of game.entities.values()) {
+      const half = LEVEL_SIZE / 2;
+      const r = rectSides(e);
+      let hit = false;
+      if (r.top < -half) { e.y += -half - r.top; hit = true; }
+      if (r.bot > half) { e.y += half - r.bot; hit = true; }
+      if (r.left < -half) { e.x += -half - r.left; hit = true; }
+      if (r.right > half) { e.x += half - r.right; hit = true; }
+      if (hit && e.projectile) dead.add(e.id);
+    }
+    fixVelocities(dt);
+
+    for (const id of dead) {
+      const e = game.entities.get(id);
+      if (!e) continue;
+      if (e.makeOnDeath) e.makeOnDeath(game, e);
+      if (game.playerId != null && e.team === TEAM_ENEMIES && e.lastHitBy === game.playerId) {
+        const pe = game.entities.get(game.playerId);
+        if (pe && pe.player) pe.player.kills += 1;
+      }
+      removeEntity(id);
+    }
+
+    for (const e of game.entities.values()) {
+      if (e.caster) e.caster.mana = Math.min(e.caster.manaMax, e.caster.mana + e.caster.manaRegen * dt);
+      if (e.health) e.health.current = Math.min(e.health.max, e.health.current + e.health.regen * dt);
+    }
+
+    for (const e of game.entities.values()) {
+      if (!e.spawnList) continue;
+      e.spawnList.t += dt;
+      while (e.spawnList.cursor < e.spawnList.list.length && e.spawnList.list[e.spawnList.cursor].t <= e.spawnList.t) {
+        const spawned = e.spawnList.list[e.spawnList.cursor].makeFn();
+        spawned.x += rand(-0.05, 0.05);
+        spawned.y += rand(-0.05, 0.05);
+        addEntity(spawned);
+        e.spawnList.cursor += 1;
+      }
+    }
+
+    for (let i = 0; i < 4; i++) {
+      let c2 = collisions().filter((ce) => {
+        const s = game.entities.get(ce.subject), o = game.entities.get(ce.object);
+        if (!s || !o || s.team == null || o.team == null) return false;
+        const sproj = !!s.projectile, oproj = !!o.projectile;
+        if (s.team === o.team && (sproj || oproj)) return false;
+        if (sproj && oproj) return false;
+        return true;
+      });
+      fixOverlaps(c2, 0.25);
+    }
+  }
+}
+
+function drawWorld() {
+  push();
+  background(20);
+  const half = LEVEL_SIZE / 2;
+  const cell = LEVEL_SIZE / 20;
+
+  stroke(40);
+  strokeWeight(1);
+  noFill();
+  for (let i = 0; i <= 20; i++) {
+    const t = -half + cell * i;
+    const hA = worldToScreen(-half, t);
+    const hB = worldToScreen(half, t);
+    line(hA.x, hA.y, hB.x, hB.y);
+    const vA = worldToScreen(t, -half);
+    const vB = worldToScreen(t, half);
+    line(vA.x, vA.y, vB.x, vB.y);
+  }
+
+  stroke(110);
+  strokeWeight(2);
+  const tl = worldToScreen(-half, -half), br = worldToScreen(half, half);
+  rectMode(CORNERS);
+  noFill();
+  rect(tl.x, tl.y, br.x, br.y);
+
+  noStroke();
+  for (const p of game.particles) {
+    const pp = worldToScreen(p.x, p.y);
+    fill(p.color[0], p.color[1], p.color[2]);
+    rectMode(CENTER);
+    rect(pp.x, pp.y, p.w * zoom, p.h * zoom);
+  }
+
+  for (const e of game.entities.values()) {
+    const p = worldToScreen(e.x, e.y);
+    const ww = e.w * zoom, hh = e.h * zoom;
+    fill(e.color[0], e.color[1], e.color[2]);
+    rectMode(CENTER);
+    rect(p.x, p.y, ww, hh);
+
+    if (e.health) {
+      const frac = Math.max(0, e.health.current / e.health.max);
+      fill(0); rect(p.x, p.y - hh * 0.8, ww * 0.9, 5);
+      fill(255, 0, 0); rect(p.x - ww * 0.45 * (1 - frac), p.y - hh * 0.8, ww * 0.9 * frac, 5);
+    }
+  }
+  pop();
+}
+
+function drawHud() {
+  push();
+  rectMode(CORNER);
+  textAlign(LEFT, TOP);
+  noStroke();
+  const pe = playerEntity();
+  fill(255);
+  textSize(14);
+  text("WASD move | Q/E cycle spells | LMB cast | R reset | P pause | M clear enemies | -/+ zoom", 12, 10);
+  text(`wave: ${game.wave}  entities: ${game.entities.size}`, 12, 28);
+  text(`zoom: ${zoom.toFixed(0)}`, 12, 46);
+
+  if (pe && pe.health && pe.caster && pe.player) {
+    const barW = 220, barH = 16;
+    fill(0); rect(16, height - 30, barW, barH);
+    fill(220, 40, 40); rect(16, height - 30, barW * (pe.health.current / pe.health.max), barH);
+    fill(0); rect(width - 16 - barW, height - 30, barW, barH);
+    fill(40, 120, 255); rect(width - 16 - barW, height - 30, barW * (pe.caster.mana / pe.caster.manaMax), barH);
+    fill(255);
+    textAlign(LEFT, BOTTOM);
+    text(`HP ${pe.health.current.toFixed(1)} / ${pe.health.max.toFixed(0)}`, 16, height - 34);
+    textAlign(RIGHT, BOTTOM);
+    text(`Mana ${pe.caster.mana.toFixed(1)} / ${pe.caster.manaMax.toFixed(0)}`, width - 16, height - 34);
+    textAlign(CENTER, BOTTOM);
+    const curSpell = pe.player.spellbook[pe.player.spellCursor] || "(no spell)";
+    text(`${curSpell} | kills: ${pe.player.kills}`, width / 2, height - 8);
+  }
+
+  if (!pe) {
+    textAlign(CENTER, CENTER);
+    textSize(24);
+    text("You died. Press R to reset.", width / 2, height * 0.75);
+  }
+
+  if (game.pause) {
+    textAlign(CENTER, CENTER);
+    textSize(40);
+    fill(255, 220);
+    text("PAUSED", width / 2, 70);
+  }
+
+  if (game.spellMenu) {
+    fill(0, 180);
+    rect(0, 0, width, height);
+    const y = height * 0.5, h = 120, w = 180, gap = 25;
+    const left = width * 0.5 - (w * 3 + gap * 2) * 0.5;
+    textAlign(CENTER, CENTER);
+    textSize(20);
+    fill(255);
+    text("Choose a spell", width * 0.5, y - 110);
+    for (let i = 0; i < 3; i++) {
+      const rx = left + i * (w + gap);
+      const hover = mouseX >= rx && mouseX <= rx + w && mouseY >= y - h / 2 && mouseY <= y + h / 2;
+      fill(hover ? 80 : 45);
+      rect(rx, y - h / 2, w, h, 10);
+      fill(255);
+      textSize(16);
+      text(game.spellMenu.choices[i], rx + w / 2, y);
+    }
+  }
+  pop();
+}
+
+function setup() {
+  createCanvas(windowWidth, windowHeight);
+  createGame();
+}
+
+function draw() {
+  const dt = Math.min(deltaTime / 1000, 1 / 20);
+  updateGame(dt);
+  drawWorld();
+  drawHud();
+  input.keyDownEvents.clear();
+  input.lmbDown = false;
+  input.lmbUp = false;
+}
+
+function windowResized() {
+  resizeCanvas(windowWidth, windowHeight);
+}
+function keyPressed() {
+  const k = key.toLowerCase();
+  input.heldKeys.add(k);
+  input.keyDownEvents.add(k);
+}
+function keyReleased() {
+  input.heldKeys.delete(key.toLowerCase());
+}
+function mousePressed() {
+  input.heldLMB = true;
+  input.lmbDown = true;
+}
+function mouseReleased() {
+  input.heldLMB = false;
+  input.lmbUp = true;
+}
+
+function mouseWheel(event) {
+  const step = event.delta > 0 ? -2.0 : 2.0;
+  zoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, zoom + step));
+  return false;
+}
+</script>
+</body>
+</html>

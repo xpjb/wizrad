@@ -1,0 +1,1447 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>wizrad merged prototype</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.0/p5.min.js"></script>
+  <style>
+    html, body { margin: 0; padding: 0; background: #0e1116; color: #e6e6e6; font-family: monospace; }
+    canvas { display: block; }
+  </style>
+</head>
+<body>
+<script>
+"use strict";
+
+const WORLD_W = 2600;
+const WORLD_H = 1700;
+const TERRAIN_SCALE = 0.0028;
+const DANGER_SCALE = 0.0045;
+const SEA_LEVEL = 0.5;
+const BEACH_BAND = 0.035;
+const GRID_CELL = 90;
+const GRID_JITTER = 0.34;
+const ROAD_NEIGHBORS = 3;
+const PLAYER_SPEED = 160;
+const ENCOUNTER_RATE = 0.22;
+const CAMERA_ZOOM = 3.45;
+const TERRAIN_TILE = 2;
+
+const BATTLE_LEVEL_SIZE = 40;
+const BATTLE_ZOOM = 34;
+const TEAM_PLAYER = 0;
+const TEAM_ENEMIES = 1;
+
+const SPELL_POOL = [
+  "Missile", "Pulse", "Fireball", "Healing", "Homing", "Water",
+  "ConeFlames", "Barrage", "Lifesteal", "Firestorm"
+];
+
+const NAME_A = ["Bel", "Dor", "Fen", "Kor", "Tallow", "Mor", "Ash", "Rin", "Var", "Lum", "Grace", "Shorn", "Mort", "Glream"];
+const NAME_B = ["ford", "haven", "watch", "crest", "gard", "mere", "hold", "spire", "port", "vale", "bridge", "wood", "gate", "hollow", "vale"];
+const TOWN_TIERS = [
+  { tier: "hamlet", emoji: "🏚️", minPop: 40, maxPop: 180 },
+  { tier: "village", emoji: "🏘️", minPop: 180, maxPop: 700 },
+  { tier: "town", emoji: "🏠", minPop: 700, maxPop: 2200 },
+  { tier: "city", emoji: "🏰", minPop: 2200, maxPop: 8000 }
+];
+
+const state = {
+  terrainSeed: 0,
+  dangerSeed: 0,
+  terrainLayer: null,
+  towns: [],
+  edges: [],
+  edgeSet: new Set(),
+  player: null,
+  uiButtons: [],
+  message: "",
+  messageTimer: 0,
+  encountersEnabled: true,
+  mode: "overworld",
+  encounter: null,
+  worldTime: 0,
+  nextEncounterAt: 0,
+  camera: { x: null, y: null, lastFrame: -1 },
+  cameraZoomMul: 1,
+  battleZoomMul: 1,
+  transition: null,
+  encounterTimeScale: 1,
+  postEncounterReport: null,
+  pendingEncounterReport: null,
+  input: {
+    heldKeys: new Set(),
+    keyDownEvents: new Set(),
+    heldLMB: false,
+    lmbDown: false,
+    lmbUp: false
+  }
+};
+
+function v(x = 0, y = 0) { return { x, y }; }
+function vAdd(a, b) { return v(a.x + b.x, a.y + b.y); }
+function vSub(a, b) { return v(a.x - b.x, a.y - b.y); }
+function vMul(a, s) { return v(a.x * s, a.y * s); }
+function vLen(a) { return Math.hypot(a.x, a.y); }
+function vNorm(a) { const l = vLen(a); return l > 1e-6 ? vMul(a, 1 / l) : v(0, 0); }
+function vDist(a, b) { return vLen(vSub(a, b)); }
+function easeInOutCubic(t) {
+  const x = constrain(t, 0, 1);
+  return x < 0.5 ? 4 * x * x * x : 1 - Math.pow(-2 * x + 2, 3) / 2;
+}
+function vRot(a, r) {
+  const c = Math.cos(r), s = Math.sin(r);
+  return v(a.x * c - a.y * s, a.x * s + a.y * c);
+}
+
+function makeTownName() {
+  return random(NAME_A) + random(NAME_B);
+}
+
+function terrainHeightAt(x, y) {
+  const n = noise(x * TERRAIN_SCALE + state.terrainSeed, y * TERRAIN_SCALE + state.terrainSeed * 0.7);
+  const ridge = noise(x * TERRAIN_SCALE * 0.6 + 300, y * TERRAIN_SCALE * 0.6 + 900);
+  return constrain(n * 0.75 + ridge * 0.25, 0, 1);
+}
+
+function dangerAt(x, y) {
+  return noise(x * DANGER_SCALE + state.dangerSeed, y * DANGER_SCALE + state.dangerSeed * 1.17);
+}
+
+function isLand(x, y) {
+  return terrainHeightAt(x, y) >= SEA_LEVEL;
+}
+
+function getCamera() {
+  const base = min(width / WORLD_W, height / WORLD_H) * 0.95;
+  const scale = base * CAMERA_ZOOM * state.cameraZoomMul;
+  const targetX = state.player ? state.player.x : WORLD_W * 0.5;
+  const targetY = state.player ? state.player.y : WORLD_H * 0.5;
+  if (state.camera.lastFrame !== frameCount) {
+    if (state.camera.x == null || state.camera.y == null) {
+      state.camera.x = targetX;
+      state.camera.y = targetY;
+    } else {
+      state.camera.x = lerp(state.camera.x, targetX, 0.14);
+      state.camera.y = lerp(state.camera.y, targetY, 0.14);
+    }
+    state.camera.lastFrame = frameCount;
+  }
+  const px = state.camera.x;
+  const py = state.camera.y;
+  const halfViewW = width * 0.5 / scale;
+  const halfViewH = height * 0.5 / scale;
+  const cx = (halfViewW * 2 >= WORLD_W) ? WORLD_W * 0.5 : constrain(px, halfViewW, WORLD_W - halfViewW);
+  const cy = (halfViewH * 2 >= WORLD_H) ? WORLD_H * 0.5 : constrain(py, halfViewH, WORLD_H - halfViewH);
+  return { scale, cx, cy };
+}
+
+function worldToScreen(x, y) {
+  const cam = getCamera();
+  return {
+    x: width * 0.5 + (x - cam.cx) * cam.scale,
+    y: height * 0.5 + (y - cam.cy) * cam.scale
+  };
+}
+
+function screenToWorld(sx, sy) {
+  const cam = getCamera();
+  return {
+    x: cam.cx + (sx - width * 0.5) / cam.scale,
+    y: cam.cy + (sy - height * 0.5) / cam.scale
+  };
+}
+
+function makeTerrainLayer() {
+  const g = createGraphics(WORLD_W, WORLD_H);
+  g.noStroke();
+  for (let y = 0; y < WORLD_H; y += TERRAIN_TILE) {
+    for (let x = 0; x < WORLD_W; x += TERRAIN_TILE) {
+      const h = terrainHeightAt(x, y);
+      if (h < SEA_LEVEL) {
+        g.fill(20, 35 + h * 20, 110 + h * 70);
+      } else if (h < SEA_LEVEL + BEACH_BAND) {
+        g.fill(214, 194, 132);
+      } else if (h < 0.8) {
+        const t = map(h, SEA_LEVEL + BEACH_BAND, 0.8, 0, 1, true);
+        g.fill(48 + t * 26, 124 + t * 46, 56 + t * 20);
+      } else if (h < 0.92) {
+        const t = map(h, 0.8, 0.92, 0, 1, true);
+        g.fill(112 + t * 36, 112 + t * 36, 112 + t * 36);
+      } else {
+        const t = map(h, 0.92, 1, 0, 1, true);
+        g.fill(230 + t * 22, 230 + t * 22, 236 + t * 19);
+      }
+      g.rect(x, y, TERRAIN_TILE, TERRAIN_TILE);
+    }
+  }
+  return g;
+}
+
+function makeTownMeta() {
+  const roll = random();
+  let chosen = TOWN_TIERS[0];
+  if (roll > 0.9) chosen = TOWN_TIERS[3];
+  else if (roll > 0.68) chosen = TOWN_TIERS[2];
+  else if (roll > 0.35) chosen = TOWN_TIERS[1];
+  return {
+    sizeTier: chosen.tier,
+    emoji: chosen.emoji,
+    population: floor(random(chosen.minPop, chosen.maxPop))
+  };
+}
+
+function lineLandFraction(a, b) {
+  const samples = 18;
+  let landCount = 0;
+  for (let i = 0; i <= samples; i++) {
+    const t = i / samples;
+    const x = lerp(a.x, b.x, t);
+    const y = lerp(a.y, b.y, t);
+    if (isLand(x, y)) landCount++;
+  }
+  return landCount / (samples + 1);
+}
+
+function addEdge(i, j) {
+  if (i === j) return;
+  const a = min(i, j);
+  const b = max(i, j);
+  const key = `${a}|${b}`;
+  if (state.edgeSet.has(key)) return;
+  state.edgeSet.add(key);
+  state.edges.push({ a, b });
+}
+
+function generateMap() {
+  noiseSeed(floor(random(1e9)));
+  randomSeed(floor(random(1e9)));
+  state.terrainSeed = random(10, 5000);
+  state.dangerSeed = random(20, 7000);
+  state.towns = [];
+  state.edges = [];
+  state.edgeSet.clear();
+  state.mode = "overworld";
+  state.encounter = null;
+  state.nextEncounterAt = 0;
+  state.transition = null;
+  state.cameraZoomMul = 1;
+  state.battleZoomMul = 1;
+  state.encounterTimeScale = 1;
+  state.postEncounterReport = null;
+  state.pendingEncounterReport = null;
+  state.camera.x = null;
+  state.camera.y = null;
+
+  for (let gy = 0; gy * GRID_CELL < WORLD_H; gy++) {
+    for (let gx = 0; gx * GRID_CELL < WORLD_W; gx++) {
+      const jx = (random() - 0.5) * GRID_CELL * GRID_JITTER * 2;
+      const jy = (random() - 0.5) * GRID_CELL * GRID_JITTER * 2;
+      const x = gx * GRID_CELL + GRID_CELL * 0.5 + jx;
+      const y = gy * GRID_CELL + GRID_CELL * 0.5 + jy;
+      if (x < 8 || y < 8 || x > WORLD_W - 8 || y > WORLD_H - 8) continue;
+      if (!isLand(x, y)) continue;
+      const meta = makeTownMeta();
+      state.towns.push({
+        id: state.towns.length,
+        x, y, gx, gy,
+        name: makeTownName(),
+        sizeTier: meta.sizeTier,
+        emoji: meta.emoji,
+        population: meta.population,
+        visited: false,
+        shopSpell: null
+      });
+    }
+  }
+
+  for (let i = 0; i < state.towns.length; i++) {
+    const a = state.towns[i];
+    const sorted = [];
+    for (let j = 0; j < state.towns.length; j++) {
+      if (i === j) continue;
+      const b = state.towns[j];
+      const cellDx = abs(a.gx - b.gx);
+      const cellDy = abs(a.gy - b.gy);
+      if (cellDx > 1 || cellDy > 1) continue;
+      sorted.push({ j, d: dist(a.x, a.y, b.x, b.y) });
+    }
+    sorted.sort((u, v2) => u.d - v2.d);
+    for (let n = 0; n < min(ROAD_NEIGHBORS, sorted.length); n++) {
+      const j = sorted[n].j;
+      if (lineLandFraction(a, state.towns[j]) >= 0.65) addEdge(i, j);
+    }
+  }
+
+  for (let i = 0; i < state.towns.length; i++) {
+    const connected = state.edges.some((e) => e.a === i || e.b === i);
+    if (connected) continue;
+    let best = -1;
+    let bestD = Infinity;
+    for (let j = 0; j < state.towns.length; j++) {
+      if (i === j) continue;
+      const a = state.towns[i];
+      const b = state.towns[j];
+      if (abs(a.gx - b.gx) > 2 || abs(a.gy - b.gy) > 2) continue;
+      const d = dist(a.x, a.y, b.x, b.y);
+      if (d < bestD && lineLandFraction(a, b) >= 0.55) {
+        bestD = d;
+        best = j;
+      }
+    }
+    if (best >= 0) addEdge(i, best);
+  }
+
+  state.terrainLayer = makeTerrainLayer();
+  initPlayer();
+}
+
+function initPlayer() {
+  if (state.towns.length < 2) {
+    state.player = null;
+    return;
+  }
+  let startIdx = 0;
+  let bestD = Infinity;
+  const cx = WORLD_W * 0.5;
+  const cy = WORLD_H * 0.5;
+  for (let i = 0; i < state.towns.length; i++) {
+    const t = state.towns[i];
+    const d = dist(t.x, t.y, cx, cy);
+    if (d < bestD) {
+      bestD = d;
+      startIdx = i;
+    }
+  }
+
+  state.towns[startIdx].visited = true;
+  state.player = {
+    atTown: startIdx,
+    targetTown: null,
+    progress: 0,
+    x: state.towns[startIdx].x,
+    y: state.towns[startIdx].y,
+    gold: 60,
+    hp: 100,
+    hpMax: 100,
+    mana: 70,
+    manaMax: 100,
+    potions: 1,
+    spells: ["Missile"],
+    spellCursor: 0
+  };
+  prepareTownShop(startIdx);
+  setMessage(`Start at ${state.towns[startIdx].name}.`);
+}
+
+function setMessage(msg) {
+  state.message = msg;
+  state.messageTimer = 3.2;
+}
+
+function neighborsOf(townId) {
+  const out = [];
+  for (const e of state.edges) {
+    if (e.a === townId) out.push(e.b);
+    else if (e.b === townId) out.push(e.a);
+  }
+  return out;
+}
+
+function prepareTownShop(townId) {
+  const town = state.towns[townId];
+  const candidates = SPELL_POOL.filter((s) => !state.player.spells.includes(s));
+  town.shopSpell = candidates.length ? random(candidates) : null;
+}
+
+function startTravel(targetTownId) {
+  if (!state.player || state.player.targetTown != null || state.mode !== "overworld") return;
+  const from = state.player.atTown;
+  const nbs = neighborsOf(from);
+  if (!nbs.includes(targetTownId)) return;
+  state.player.targetTown = targetTownId;
+  state.player.progress = 0;
+}
+
+function arriveTown() {
+  const p = state.player;
+  const town = state.towns[p.atTown];
+  town.visited = true;
+  prepareTownShop(p.atTown);
+  setMessage(`Arrived at ${town.name}. Shop is open.`);
+}
+
+function maybeStartEncounter(danger) {
+  if (!state.encountersEnabled) return false;
+  if (state.worldTime < state.nextEncounterAt) return false;
+  if (random() < ENCOUNTER_RATE * danger * (deltaTime / 1000)) {
+    beginEncounterTransition(danger);
+    return true;
+  }
+  return false;
+}
+
+function updateTravel(dt) {
+  const p = state.player;
+  if (!p || p.targetTown == null || state.mode !== "overworld") return;
+  const a = state.towns[p.atTown];
+  const b = state.towns[p.targetTown];
+  const d = max(1, dist(a.x, a.y, b.x, b.y));
+  p.progress += (PLAYER_SPEED * dt) / d;
+
+  const rawT = constrain(p.progress, 0, 1);
+  const t = rawT * rawT * (3 - 2 * rawT); // smoothstep for eased start/stop movement
+  p.x = lerp(a.x, b.x, t);
+  p.y = lerp(a.y, b.y, t);
+
+  const danger = dangerAt(p.x, p.y);
+  if (maybeStartEncounter(danger)) return;
+
+  if (p.progress >= 1) {
+    p.atTown = p.targetTown;
+    p.targetTown = null;
+    p.progress = 0;
+    p.x = b.x;
+    p.y = b.y;
+    arriveTown();
+  }
+}
+
+function drawWorld() {
+  background(10, 14, 18);
+  const cam = getCamera();
+
+  push();
+  translate(width * 0.5, height * 0.5);
+  scale(cam.scale);
+  translate(-cam.cx, -cam.cy);
+  image(state.terrainLayer, 0, 0, WORLD_W, WORLD_H);
+
+  strokeWeight(2 / cam.scale);
+  const playerTown = state.player ? state.player.atTown : -1;
+  for (const e of state.edges) {
+    const a = state.towns[e.a];
+    const b = state.towns[e.b];
+    const connectedToCurrent = e.a === playerTown || e.b === playerTown;
+    stroke(connectedToCurrent ? color(175, 136, 82, 240) : color(102, 84, 58, 95));
+    line(a.x, a.y, b.x, b.y);
+  }
+
+  textAlign(CENTER, CENTER);
+  for (const town of state.towns) {
+    const isAtTown = state.player && town.id === state.player.atTown;
+    noStroke();
+    fill(town.visited ? color(255, 236, 186, 180) : color(220, 205, 185, 135));
+    circle(town.x, town.y, 16 / cam.scale);
+    if (isAtTown) {
+      stroke(255, 228, 100);
+      strokeWeight(3 / cam.scale);
+      noFill();
+      circle(town.x, town.y, (26 + sin(frameCount * 0.12) * 2.5) / cam.scale);
+    }
+  }
+  pop();
+
+  textAlign(CENTER, CENTER);
+  for (const town of state.towns) {
+    const s = worldToScreen(town.x, town.y);
+    noStroke();
+    textSize(72);
+    text(town.emoji, s.x, s.y - 6);
+    fill(15);
+    textSize(13);
+    text(town.name, s.x, s.y + 18);
+    if (state.player && town.id === state.player.atTown && state.player.targetTown == null) {
+      fill(255, 245, 145);
+      textSize(12);
+      text("YOU ARE HERE", s.x, s.y - 32);
+    }
+  }
+
+  if (state.player) {
+    const ps = worldToScreen(state.player.x, state.player.y);
+    noStroke();
+    textSize(56);
+    text("🧙", ps.x, ps.y - 34);
+  }
+}
+
+function drawHud() {
+  if (!state.player) return;
+  rectMode(CORNER);
+  const p = state.player;
+  const at = state.towns[p.atTown];
+  const d = dangerAt(p.x, p.y);
+  const margin = 12;
+  const leftPanelW = constrain(width * 0.42, 350, 520);
+  const leftPanelH = 178;
+
+  noStroke();
+  fill(0, 170);
+  rect(margin, margin, leftPanelW, leftPanelH, 8);
+  fill(240);
+  textAlign(LEFT, TOP);
+  textSize(13);
+  const tx = margin + 10;
+  const tw = leftPanelW - 20;
+  text("Merged Outer Loop + Encounter Prototype", tx, margin + 10, tw);
+  text(`Town: ${at.name} (${at.sizeTier}, pop ${at.population})${p.targetTown != null ? " (traveling)" : ""}`, tx, margin + 31, tw);
+  text(`HP: ${p.hp.toFixed(0)}/${p.hpMax}   Gold: ${p.gold}   Mana: ${p.mana.toFixed(0)}/${p.manaMax}`, tx, margin + 51, tw);
+  text(`Danger: ${(d * 100).toFixed(0)}%   Encounters: ${state.encountersEnabled ? "ON" : "OFF"}`, tx, margin + 71, tw);
+  text("Map: click connected town to travel | P potion | E encounters | R regenerate", tx, margin + 95, tw, 34);
+  text("Encounter: WASD move | Q/E spell | Hold LMB cast", tx, margin + 132, tw, 28);
+
+  drawShopPanel();
+  drawMessageToast();
+}
+
+function drawShopPanel() {
+  state.uiButtons = [];
+  const p = state.player;
+  if (!p || p.targetTown != null || state.mode !== "overworld") return;
+  rectMode(CORNER);
+  const town = state.towns[p.atTown];
+  const margin = 12;
+  const preferredW = 310;
+  const w = min(preferredW, width - margin * 2);
+  const leftHudRight = margin + constrain(width * 0.42, 350, 520);
+  let x = width - w - margin;
+  let y = margin;
+  if (x < leftHudRight + 10) {
+    x = margin;
+    y = 196;
+  }
+  const h = 176;
+  const buttonColW = 90;
+  const textColW = w - 24 - buttonColW;
+
+  fill(0, 170);
+  noStroke();
+  rect(x, y, w, h, 8);
+  fill(245);
+  textSize(13);
+  textAlign(LEFT, TOP);
+  const tx = x + 10;
+  const bx = x + w - buttonColW + 4;
+  text(`Shop at ${town.emoji} ${town.name}`, tx, y + 10, w - 20, 22);
+  text("Mana Potion (+35 mana) - 12g", tx, y + 40, textColW, 34);
+  text(`Spell: ${town.shopSpell || "(sold out)"}`, tx, y + 84, textColW, 34);
+  text("Buy spell - 24g", tx, y + 126, textColW, 20);
+
+  const b1 = { x: bx, y: y + 44, w: 76, h: 24, kind: "potion" };
+  const b2 = { x: bx, y: y + 122, w: 76, h: 24, kind: "spell" };
+  drawButton(b1, "Buy");
+  drawButton(b2, "Buy");
+  state.uiButtons.push(b1, b2);
+}
+
+function drawButton(b, label) {
+  rectMode(CORNER);
+  fill(68, 86, 110);
+  rect(b.x, b.y, b.w, b.h, 6);
+  fill(240);
+  textAlign(CENTER, CENTER);
+  text(label, b.x + b.w * 0.5, b.y + b.h * 0.5);
+}
+
+function tryBuy(kind) {
+  const p = state.player;
+  const town = state.towns[p.atTown];
+  if (kind === "potion") {
+    if (p.gold < 12) return setMessage("Not enough gold.");
+    p.gold -= 12;
+    p.potions += 1;
+    return setMessage("Bought 1 mana potion.");
+  }
+
+  if (kind === "spell") {
+    if (!town.shopSpell) return setMessage("No spell available.");
+    if (p.gold < 24) return setMessage("Not enough gold.");
+    p.gold -= 24;
+    p.spells.push(town.shopSpell);
+    p.spellCursor = constrain(p.spellCursor, 0, p.spells.length - 1);
+    setMessage(`Learned ${town.shopSpell}.`);
+    town.shopSpell = null;
+  }
+}
+
+function onWorldClick(mx, my) {
+  const p = state.player;
+  if (!p || p.targetTown != null || state.mode !== "overworld") return;
+  const w = screenToWorld(mx, my);
+  const nbs = neighborsOf(p.atTown);
+  let best = null;
+  let bestD = 99999;
+  for (const id of nbs) {
+    const t = state.towns[id];
+    const d = dist(w.x, w.y, t.x, t.y);
+    if (d < bestD) {
+      bestD = d;
+      best = id;
+    }
+  }
+  if (best != null && bestD <= 26) startTravel(best);
+}
+
+function makeEntity() {
+  return {
+    id: -1, x: 0, y: 0, w: 1, h: 1, vx: 0, vy: 0,
+    team: null, color: [255, 255, 255], mass: 1,
+    health: null, caster: null, player: null, ai: null, aiCaster: null, projectile: null,
+    expiry: null, meleeDamage: 0, meleeCooldown: 0.6, nextMeleeAt: 0
+  };
+}
+
+function encounterAddEntity(enc, e) {
+  e.id = enc.nextId++;
+  enc.entities.set(e.id, e);
+  if (e.player) enc.playerId = e.id;
+  if (e.team === TEAM_ENEMIES && !e.projectile) {
+    const type = e.enemyType || "Unknown";
+    enc.enemyRoster[type] = (enc.enemyRoster[type] || 0) + 1;
+  }
+  return e;
+}
+
+function encounterPlayerEntity(enc) {
+  return enc.playerId != null ? enc.entities.get(enc.playerId) : null;
+}
+
+function makeEncounterPlayer(overworldPlayer) {
+  const e = makeEntity();
+  e.x = 0;
+  e.y = 0;
+  e.w = 1;
+  e.h = 1;
+  e.team = TEAM_PLAYER;
+  e.color = [255, 60, 255];
+  e.player = { speed: 10, spellCursor: overworldPlayer.spellCursor };
+  e.caster = { manaMax: overworldPlayer.manaMax, mana: overworldPlayer.mana, manaRegen: 14, lastCast: -999 };
+  e.health = { max: overworldPlayer.hpMax, current: overworldPlayer.hp, regen: 0.35 };
+  return e;
+}
+
+function makeZerg(pos) {
+  const e = makeEntity();
+  e.x = pos.x; e.y = pos.y; e.w = 0.6; e.h = 0.6;
+  e.team = TEAM_ENEMIES;
+  e.mass = 0.3;
+  e.color = [170, 20, 20];
+  e.health = { max: 24, current: 24, regen: 0.1 };
+  e.ai = { speed: 7.8, accel: 8, range: 15, flee: 0 };
+  e.meleeDamage = 14;
+  e.meleeCooldown = 0.65;
+  e.enemyType = "Zerg";
+  return e;
+}
+
+function makeMissileCaster(pos) {
+  const e = makeEntity();
+  e.x = pos.x; e.y = pos.y; e.w = 0.95; e.h = 0.95;
+  e.team = TEAM_ENEMIES;
+  e.mass = 0.8;
+  e.color = [50, 190, 190];
+  e.health = { max: 38, current: 38, regen: 0.2 };
+  e.ai = { speed: 3.3, accel: 6, range: 13, flee: 5 };
+  e.aiCaster = { spell: "Missile", range: 11 };
+  e.caster = { manaMax: 26, mana: 26, manaRegen: 5, lastCast: -999 };
+  e.enemyType = "Missile Caster";
+  return e;
+}
+
+function makeBloodcaster(pos) {
+  const e = makeEntity();
+  e.x = pos.x; e.y = pos.y; e.w = 1.0; e.h = 1.0;
+  e.team = TEAM_ENEMIES;
+  e.mass = 1.0;
+  e.color = [105, 75, 75];
+  e.health = { max: 60, current: 60, regen: 0.2 };
+  e.ai = { speed: 4.5, accel: 6, range: 12, flee: 5 };
+  e.aiCaster = { spell: "Lifesteal", range: 8 };
+  e.caster = { manaMax: 999, mana: 999, manaRegen: 0, lastCast: -999 };
+  e.enemyType = "Bloodcaster";
+  return e;
+}
+
+function makeBarrager(pos) {
+  const e = makeEntity();
+  e.x = pos.x; e.y = pos.y; e.w = 1.3; e.h = 1.3;
+  e.team = TEAM_ENEMIES;
+  e.mass = 1.8;
+  e.color = [150, 20, 200];
+  e.health = { max: 95, current: 95, regen: 0.2 };
+  e.ai = { speed: 2.8, accel: 5, range: 20, flee: 8 };
+  e.aiCaster = { spell: "Barrage", range: 16 };
+  e.caster = { manaMax: 50, mana: 50, manaRegen: 6, lastCast: -999 };
+  e.enemyType = "Barrager";
+  return e;
+}
+
+function makeSummoner(pos) {
+  const e = makeEntity();
+  e.x = pos.x; e.y = pos.y; e.w = 1.2; e.h = 1.2;
+  e.team = TEAM_ENEMIES;
+  e.mass = 2;
+  e.color = [130, 20, 20];
+  e.health = { max: 110, current: 110, regen: 0.25 };
+  e.ai = { speed: 2.2, accel: 5, range: 16, flee: 6 };
+  e.aiCaster = { spell: "SummonRushers", range: 13 };
+  e.caster = { manaMax: 45, mana: 45, manaRegen: 4, lastCast: -999 };
+  e.enemyType = "Summoner";
+  return e;
+}
+
+function createEncounter(danger) {
+  const p = state.player;
+  const enc = {
+    t: 0,
+    danger,
+    entities: new Map(),
+    nextId: 1,
+    playerId: null,
+    enemyRoster: {},
+    startGold: p.gold,
+    startHp: p.hp,
+    startMana: p.mana
+  };
+  encounterAddEntity(enc, makeEncounterPlayer(p));
+  spawnEncounterEnemies(enc, danger);
+  state.encounter = enc;
+  state.encounterTimeScale = 0.18;
+  state.battleZoomMul = 1.22;
+  setMessage(`Encounter! Danger ${(danger * 100).toFixed(0)}%`);
+}
+
+function beginEncounterTransition(danger) {
+  if (state.mode !== "overworld") return;
+  state.mode = "transition_to_encounter";
+  state.transition = {
+    phase: "out",
+    t: 0,
+    outDuration: 0.8,
+    inDuration: 0.9,
+    danger
+  };
+}
+
+function drawBlackOverlay(alpha) {
+  if (alpha <= 0) return;
+  noStroke();
+  fill(0, constrain(alpha, 0, 255));
+  rectMode(CORNER);
+  rect(0, 0, width, height);
+}
+
+function updateEncounterTransition(dt) {
+  const tr = state.transition;
+  if (!tr) return;
+
+  if (tr.phase === "out") {
+    tr.t += dt;
+    const p = constrain(tr.t / tr.outDuration, 0, 1);
+    state.cameraZoomMul = lerp(1, 1.34, easeInOutCubic(p));
+    drawWorld();
+    drawHud();
+    drawBlackOverlay(Math.pow(p, 1.05) * 255);
+    if (p >= 1) {
+      createEncounter(tr.danger);
+      tr.phase = "in";
+      tr.t = 0;
+      state.cameraZoomMul = 1;
+    }
+    return;
+  }
+
+  tr.t += dt;
+  const p = constrain(tr.t / tr.inDuration, 0, 1);
+  state.battleZoomMul = lerp(1.22, 1, easeInOutCubic(p));
+  drawEncounterWorld();
+  drawEncounterHud();
+  drawBlackOverlay((1 - p) * 255);
+  if (p >= 1) {
+    state.battleZoomMul = 1;
+    state.mode = "encounter";
+    state.transition = null;
+  }
+}
+
+function updateReturnToOverworldTransition(dt) {
+  const tr = state.transition;
+  if (!tr) return;
+
+  if (tr.phase === "out") {
+    tr.t += dt;
+    const p = constrain(tr.t / tr.outDuration, 0, 1);
+    state.battleZoomMul = lerp(1, 1.2, easeInOutCubic(p));
+    drawEncounterWorld();
+    drawEncounterHud();
+    drawBlackOverlay(Math.pow(p, 1.05) * 255);
+    if (p >= 1) {
+      state.encounter = null;
+      tr.phase = "in";
+      tr.t = 0;
+      state.cameraZoomMul = 1.2;
+      state.battleZoomMul = 1;
+    }
+    return;
+  }
+
+  tr.t += dt;
+  const p = constrain(tr.t / tr.inDuration, 0, 1);
+  state.cameraZoomMul = lerp(1.2, 1, easeInOutCubic(p));
+  drawWorld();
+  drawHud();
+  drawBlackOverlay((1 - p) * 255);
+  if (p >= 1) {
+    state.mode = "overworld";
+    state.postEncounterReport = state.pendingEncounterReport;
+    state.pendingEncounterReport = null;
+    state.transition = null;
+    state.cameraZoomMul = 1;
+    state.battleZoomMul = 1;
+    state.encounterTimeScale = 1;
+  }
+}
+
+function spawnEncounterEnemies(enc, danger) {
+  let budget = 4 + floor(danger * 15);
+  const half = BATTLE_LEVEL_SIZE * 0.5 - 2.5;
+  const spawnNearEdge = () => {
+    const edge = floor(random(4));
+    if (edge === 0) return v(random(-half, half), -half);
+    if (edge === 1) return v(random(-half, half), half);
+    if (edge === 2) return v(-half, random(-half, half));
+    return v(half, random(-half, half));
+  };
+  while (budget > 0) {
+    const r = random();
+    const pos = spawnNearEdge();
+    if (r < 0.45 || budget <= 1) {
+      encounterAddEntity(enc, makeZerg(pos));
+      budget -= 1;
+    } else if (r < 0.68 || budget <= 2) {
+      encounterAddEntity(enc, makeMissileCaster(pos));
+      budget -= 2;
+    } else if (r < 0.82 || budget <= 3) {
+      encounterAddEntity(enc, makeBloodcaster(pos));
+      budget -= 3;
+    } else if (r < 0.93 || budget <= 4) {
+      encounterAddEntity(enc, makeSummoner(pos));
+      budget -= 4;
+    } else {
+      encounterAddEntity(enc, makeBarrager(pos));
+      budget -= 5;
+    }
+  }
+}
+
+function formatSigned(n) {
+  const rounded = Math.round(n);
+  if (rounded > 0) return `+${rounded}`;
+  return `${rounded}`;
+}
+
+function drawEncounterReportModal() {
+  const rep = state.postEncounterReport;
+  if (!rep || state.mode !== "overworld") return;
+
+  rectMode(CORNER);
+  noStroke();
+  fill(0, 185);
+  rect(0, 0, width, height);
+
+  const panelW = min(620, width - 40);
+  const panelH = min(460, height - 40);
+  const x = (width - panelW) * 0.5;
+  const y = (height - panelH) * 0.5;
+
+  fill(20, 24, 34, 245);
+  rect(x, y, panelW, panelH, 12);
+  fill(235);
+  textAlign(LEFT, TOP);
+  textSize(24);
+  text("Encounter Report", x + 18, y + 14);
+
+  textSize(15);
+  text(`Outcome: ${rep.outcome}    Danger: ${rep.dangerPct}%`, x + 18, y + 52, panelW - 36, 24);
+  text(`Gold: ${formatSigned(rep.goldDelta)}    HP: ${formatSigned(rep.hpDelta)}    Mana: ${formatSigned(rep.manaDelta)}`, x + 18, y + 84, panelW - 36, 24);
+
+  textSize(16);
+  text("Enemies Encountered:", x + 18, y + 118);
+  textSize(14);
+  let rowY = y + 146;
+  if (rep.enemies.length === 0) {
+    text("- None", x + 22, rowY);
+  } else {
+    for (const line of rep.enemies) {
+      if (rowY > y + panelH - 90) break;
+      text(`- ${line}`, x + 22, rowY, panelW - 44, 20);
+      rowY += 22;
+    }
+  }
+
+  const buttonW = 128;
+  const buttonH = 34;
+  const bx = x + panelW - buttonW - 18;
+  const by = y + panelH - buttonH - 16;
+  fill(66, 84, 112);
+  rect(bx, by, buttonW, buttonH, 8);
+  fill(240);
+  textAlign(CENTER, CENTER);
+  textSize(14);
+  text("Continue", bx + buttonW * 0.5, by + buttonH * 0.5);
+}
+
+function battleCamera(enc) {
+  const pe = encounterPlayerEntity(enc);
+  const cx0 = pe ? pe.x : 0;
+  const cy0 = pe ? pe.y : 0;
+  const zoom = BATTLE_ZOOM * state.battleZoomMul;
+  const viewW = width / zoom;
+  const viewH = height / zoom;
+  const look = v((mouseX / max(width, 1) - 0.5) * viewW, (mouseY / max(height, 1) - 0.5) * viewH);
+  return { cx: cx0 + look.x * 0.2, cy: cy0 + look.y * 0.2 };
+}
+
+function battleWorldToScreen(enc, wx, wy) {
+  const cam = battleCamera(enc);
+  const zoom = BATTLE_ZOOM * state.battleZoomMul;
+  return v((wx - cam.cx) * zoom + width * 0.5, (wy - cam.cy) * zoom + height * 0.5);
+}
+
+function battleScreenToWorld(enc, sx, sy) {
+  const cam = battleCamera(enc);
+  const zoom = BATTLE_ZOOM * state.battleZoomMul;
+  return v(cam.cx + (sx - width * 0.5) / zoom, cam.cy + (sy - height * 0.5) / zoom);
+}
+
+function addProjectile(enc, team, sourceId, pos, vel, size, damage, color, extra = {}) {
+  const e = makeEntity();
+  e.team = team;
+  e.x = pos.x;
+  e.y = pos.y;
+  e.w = size;
+  e.h = size;
+  e.vx = vel.x;
+  e.vy = vel.y;
+  e.mass = extra.mass ?? 0.5;
+  e.color = color;
+  e.projectile = {
+    sourceId,
+    damage,
+    lifesteal: extra.lifesteal ?? 0,
+    aoe: extra.aoe ?? 0,
+    homing: extra.homing ?? false
+  };
+  e.expiry = enc.t + (extra.ttl ?? 2.4);
+  encounterAddEntity(enc, e);
+}
+
+function castSpell(enc, caster, target, spell, repeat, dt) {
+  if (!caster || !caster.caster) return;
+  const cc = caster.caster;
+  const casterPos = v(caster.x, caster.y);
+  const dir = vNorm(vSub(target, casterPos));
+  const aim = vLen(dir) > 0 ? dir : v(0, -1);
+  const team = caster.team;
+
+  if (spell === "ConeFlames") {
+    if (cc.mana >= 1.0) {
+      cc.mana -= 1.0;
+      for (let i = 0; i < 4; i++) {
+        const vel = vMul(vRot(aim, random(-0.25, 0.25)), 10.0);
+        addProjectile(enc, team, caster.id, casterPos, vel, 0.22, 2.2, [255, random(50, 220), 10], { ttl: random(0.6, 0.85) });
+      }
+    }
+    return;
+  }
+
+  if (spell === "Barrage") {
+    if (cc.lastCast + 0.1 > enc.t) return;
+    cc.lastCast = enc.t;
+    if (cc.mana >= 5.0) {
+      cc.mana -= 5.0;
+      addProjectile(enc, team, caster.id, casterPos, vMul(vRot(aim, random(-0.55, 0.55)), 9.0), 0.5, 24.0, [210, 40, 210], { ttl: 2.3 });
+    }
+    return;
+  }
+
+  if (spell === "Water") {
+    if (cc.mana >= 0.4) {
+      cc.mana -= 0.4;
+      for (let i = 0; i < 7; i++) {
+        addProjectile(enc, team, caster.id, casterPos, vMul(vRot(aim, random(-0.6, 0.6)), 6.0), 0.22, 0.0, [40, 120, 255], { mass: 8, ttl: random(0.6, 0.9) });
+      }
+    }
+    return;
+  }
+
+  if (spell === "Missile") {
+    if (repeat || cc.lastCast + 0.3 > enc.t) return;
+    cc.lastCast = enc.t;
+    if (cc.mana >= 10.0) {
+      cc.mana -= 10.0;
+      addProjectile(enc, team, caster.id, casterPos, vMul(aim, 15.0), 0.4, 34.0, [220, 10, 220], { ttl: 2.4 });
+    }
+    return;
+  }
+
+  if (spell === "Homing") {
+    if (repeat || cc.lastCast + 0.3 > enc.t) return;
+    cc.lastCast = enc.t;
+    if (cc.mana >= 25.0) {
+      cc.mana -= 25.0;
+      addProjectile(enc, team, caster.id, casterPos, vMul(aim, 5.0), 0.5, 20.0, [20, 110, 255], { homing: true, ttl: 4.2 });
+      addProjectile(enc, team, caster.id, casterPos, vMul(vRot(aim, -0.8), 5.0), 0.5, 20.0, [20, 110, 255], { homing: true, ttl: 4.2 });
+      addProjectile(enc, team, caster.id, casterPos, vMul(vRot(aim, 0.8), 5.0), 0.5, 20.0, [20, 110, 255], { homing: true, ttl: 4.2 });
+    }
+    return;
+  }
+
+  if (spell === "Pulse") {
+    if (cc.lastCast + 0.1 > enc.t) return;
+    cc.lastCast = enc.t;
+    if (cc.mana >= 6.0) {
+      cc.mana -= 6.0;
+      addProjectile(enc, team, caster.id, casterPos, vMul(aim, 25.0), 0.4, 34.0, [20, 220, 20], { ttl: 0.18 });
+    }
+    return;
+  }
+
+  if (spell === "Lifesteal") {
+    if (cc.lastCast + 0.5 > enc.t) return;
+    cc.lastCast = enc.t;
+    if (caster.health && caster.health.current >= 10.0) {
+      caster.health.current -= 10.0;
+      addProjectile(enc, team, caster.id, casterPos, vMul(aim, 10.0), 0.4, 20.0, [220, 30, 30], { lifesteal: 0.7, ttl: 2.1 });
+    }
+    return;
+  }
+
+  if (spell === "Fireball") {
+    if (repeat || cc.lastCast + 0.3 > enc.t) return;
+    cc.lastCast = enc.t;
+    if (cc.mana >= 30.0) {
+      cc.mana -= 30.0;
+      addProjectile(enc, team, caster.id, casterPos, vMul(aim, 10.0), 0.55, 50.0, [255, 40, 0], { aoe: 3.7, ttl: 2.6 });
+    }
+    return;
+  }
+
+  if (spell === "Firestorm") {
+    if (cc.lastCast + 0.25 > enc.t) return;
+    cc.lastCast = enc.t;
+    if (cc.mana >= 8.0) {
+      cc.mana -= 8.0;
+      addProjectile(enc, team, caster.id, casterPos, vMul(aim, 15.0), 0.5, 18.0, [255, 0, 0], { aoe: 1.8, ttl: 1.6 });
+    }
+    return;
+  }
+
+  if (spell === "SummonRushers") {
+    if (repeat || cc.lastCast + 0.6 > enc.t) return;
+    cc.lastCast = enc.t;
+    if (cc.mana >= 20.0) {
+      cc.mana -= 20.0;
+      encounterAddEntity(enc, makeZerg(v(casterPos.x + 1.0, casterPos.y)));
+      encounterAddEntity(enc, makeZerg(v(casterPos.x - 0.5, casterPos.y + 0.86)));
+      encounterAddEntity(enc, makeZerg(v(casterPos.x - 0.5, casterPos.y - 0.86)));
+    }
+    return;
+  }
+
+  if (spell === "Healing") {
+    if (caster.health && cc.mana >= 30.0 * dt) {
+      caster.health.current = min(caster.health.max, caster.health.current + 30.0 * dt);
+      cc.mana -= 30.0 * dt;
+      cc.lastCast = enc.t;
+    }
+  }
+}
+
+function battleDamage(enc, targetId, amount, srcId) {
+  const t = enc.entities.get(targetId);
+  if (!t || !t.health) return;
+  t.health.current -= amount;
+  t.lastHitBy = srcId;
+}
+
+function updateEncounter(dt) {
+  const enc = state.encounter;
+  if (!enc) return;
+  enc.t += dt;
+  const pe = encounterPlayerEntity(enc);
+  if (!pe) {
+    endEncounter(false);
+    return;
+  }
+
+  const move = v(
+    (state.input.heldKeys.has("d") ? 1 : 0) - (state.input.heldKeys.has("a") ? 1 : 0),
+    (state.input.heldKeys.has("s") ? 1 : 0) - (state.input.heldKeys.has("w") ? 1 : 0)
+  );
+  const dir = vNorm(move);
+  pe.vx = dir.x * pe.player.speed;
+  pe.vy = dir.y * pe.player.speed;
+
+  if (state.input.keyDownEvents.has("q")) pe.player.spellCursor = max(0, pe.player.spellCursor - 1);
+  if (state.input.keyDownEvents.has("e")) pe.player.spellCursor = min(state.player.spells.length - 1, pe.player.spellCursor + 1);
+
+  const mouseWorld = battleScreenToWorld(enc, mouseX, mouseY);
+  const spell = state.player.spells[pe.player.spellCursor];
+  if (spell) {
+    if (state.input.lmbDown) castSpell(enc, pe, mouseWorld, spell, false, dt);
+    else if (state.input.heldLMB) castSpell(enc, pe, mouseWorld, spell, true, dt);
+  }
+
+  const ents = Array.from(enc.entities.values());
+  for (const e of ents) {
+    if (!e.ai) continue;
+    const enemies = ents.filter((o) => o.id !== e.id && o.team != null && o.team !== e.team && !o.projectile);
+    let target = null;
+    let bestDist = Infinity;
+    for (const o of enemies) {
+      const d = vDist(v(e.x, e.y), v(o.x, o.y));
+      if (d < bestDist) { bestDist = d; target = o; }
+    }
+    if (target) {
+      let d = vNorm(vSub(v(target.x, target.y), v(e.x, e.y)));
+      if (bestDist < e.ai.flee) d = vMul(d, -1);
+      const tv = vMul(d, e.ai.speed);
+      e.vx += e.ai.accel * dt * (tv.x - e.vx);
+      e.vy += e.ai.accel * dt * (tv.y - e.vy);
+    } else {
+      e.vx *= 0.94;
+      e.vy *= 0.94;
+    }
+  }
+
+  for (const e of ents) {
+    if (!e.aiCaster || !e.caster) continue;
+    let target = null;
+    let bestDist = Infinity;
+    for (const o of ents) {
+      if (o.id === e.id || o.team == null || o.team === e.team || o.projectile) continue;
+      const d = vDist(v(e.x, e.y), v(o.x, o.y));
+      if (d < bestDist) { bestDist = d; target = o; }
+    }
+    if (target) castSpell(enc, e, v(target.x, target.y), e.aiCaster.spell, false, dt);
+  }
+
+  for (const e of enc.entities.values()) {
+    if (!e.projectile || !e.projectile.homing) continue;
+    const targets = Array.from(enc.entities.values()).filter((o) => o.team != null && o.team !== e.team && !o.projectile);
+    let best = null, bestDist = Infinity;
+    for (const t of targets) {
+      const d = vDist(v(e.x, e.y), v(t.x, t.y));
+      if (d < bestDist) { bestDist = d; best = t; }
+    }
+    if (best) {
+      const cur = vNorm(v(e.vx, e.vy));
+      const want = vNorm(vSub(v(best.x, best.y), v(e.x, e.y)));
+      const mixed = vNorm(vAdd(vMul(cur, 0.88), vMul(want, 0.12)));
+      const speed = max(1, vLen(v(e.vx, e.vy)));
+      e.vx = mixed.x * speed;
+      e.vy = mixed.y * speed;
+    }
+  }
+
+  const half = BATTLE_LEVEL_SIZE * 0.5;
+  for (const e of enc.entities.values()) {
+    e.x += e.vx * dt;
+    e.y += e.vy * dt;
+    const hw = e.w * 0.5;
+    const hh = e.h * 0.5;
+    if (e.x - hw < -half) { e.x = -half + hw; if (e.projectile) e.expiry = 0; }
+    if (e.x + hw > half) { e.x = half - hw; if (e.projectile) e.expiry = 0; }
+    if (e.y - hh < -half) { e.y = -half + hh; if (e.projectile) e.expiry = 0; }
+    if (e.y + hh > half) { e.y = half - hh; if (e.projectile) e.expiry = 0; }
+  }
+
+  const dead = new Set();
+  for (const p of enc.entities.values()) {
+    if (!p.projectile) continue;
+    for (const t of enc.entities.values()) {
+      if (t.id === p.id || t.team == null || t.team === p.team || !t.health) continue;
+      const hit = abs(p.x - t.x) <= (p.w + t.w) * 0.5 && abs(p.y - t.y) <= (p.h + t.h) * 0.5;
+      if (!hit) continue;
+      if (p.projectile.aoe > 0) {
+        for (const aoeTarget of enc.entities.values()) {
+          if (!aoeTarget.health || aoeTarget.team === p.team) continue;
+          if (vDist(v(aoeTarget.x, aoeTarget.y), v(t.x, t.y)) <= p.projectile.aoe) {
+            battleDamage(enc, aoeTarget.id, p.projectile.damage, p.projectile.sourceId);
+          }
+        }
+      } else {
+        battleDamage(enc, t.id, p.projectile.damage, p.projectile.sourceId);
+      }
+      if (p.projectile.lifesteal > 0) {
+        const src = enc.entities.get(p.projectile.sourceId);
+        if (src && src.health) src.health.current = min(src.health.max, src.health.current + p.projectile.lifesteal * p.projectile.damage);
+      }
+      dead.add(p.id);
+      break;
+    }
+  }
+
+  for (const a of enc.entities.values()) {
+    if (!a.meleeDamage || a.team == null || a.nextMeleeAt > enc.t) continue;
+    for (const b of enc.entities.values()) {
+      if (a.id === b.id || b.team == null || b.team === a.team || !b.health) continue;
+      const close = vDist(v(a.x, a.y), v(b.x, b.y)) <= (a.w + b.w) * 0.6;
+      if (close) {
+        battleDamage(enc, b.id, a.meleeDamage, a.id);
+        a.nextMeleeAt = enc.t + a.meleeCooldown;
+        break;
+      }
+    }
+  }
+
+  for (const e of enc.entities.values()) {
+    if (e.expiry != null && e.expiry <= enc.t) dead.add(e.id);
+    if (e.health && e.health.current <= 0) dead.add(e.id);
+    if (e.caster) e.caster.mana = min(e.caster.manaMax, e.caster.mana + e.caster.manaRegen * dt);
+    if (e.health) e.health.current = min(e.health.max, e.health.current + e.health.regen * dt);
+  }
+  for (const id of dead) enc.entities.delete(id);
+
+  const hasEnemies = Array.from(enc.entities.values()).some((e) => e.team === TEAM_ENEMIES && !e.projectile);
+  const playerNow = encounterPlayerEntity(enc);
+  if (!playerNow || (playerNow.health && playerNow.health.current <= 0)) {
+    endEncounter(false);
+  } else if (!hasEnemies) {
+    endEncounter(true);
+  } else {
+    state.player.hp = constrain(playerNow.health.current, 0, state.player.hpMax);
+    state.player.mana = constrain(playerNow.caster.mana, 0, state.player.manaMax);
+    state.player.spellCursor = constrain(playerNow.player.spellCursor, 0, max(0, state.player.spells.length - 1));
+  }
+}
+
+function endEncounter(victory) {
+  if (!state.encounter || !state.player) return;
+  const enc = state.encounter;
+  const danger = enc.danger;
+  if (victory) {
+    const reward = floor(6 + danger * 24 + random(0, 8));
+    state.player.gold += reward;
+    state.player.mana = min(state.player.manaMax, state.player.mana + 10 + danger * 15);
+    setMessage(`Encounter won! +${reward}g`);
+  } else {
+    const loss = floor(8 + danger * 20);
+    state.player.gold = max(0, state.player.gold - loss);
+    state.player.hp = max(20, floor(state.player.hpMax * 0.45));
+    state.player.mana = min(state.player.mana, 40);
+    state.player.targetTown = null;
+    state.player.progress = 0;
+    const at = state.towns[state.player.atTown];
+    state.player.x = at.x;
+    state.player.y = at.y;
+    setMessage(`Defeated in encounter. Lost ${loss}g and retreated.`);
+  }
+  const enemyLines = Object.entries(enc.enemyRoster)
+    .sort((a, b) => b[1] - a[1])
+    .map(([name, count]) => `${name} x${count}`);
+  state.pendingEncounterReport = {
+    outcome: victory ? "Victory" : "Defeat",
+    dangerPct: (danger * 100).toFixed(0),
+    enemies: enemyLines,
+    goldDelta: state.player.gold - enc.startGold,
+    hpDelta: state.player.hp - enc.startHp,
+    manaDelta: state.player.mana - enc.startMana
+  };
+  state.nextEncounterAt = state.worldTime + 3.0;
+  state.mode = "transition_to_overworld";
+  state.transition = {
+    phase: "out",
+    t: 0,
+    outDuration: 0.55,
+    inDuration: 0.72
+  };
+}
+
+function drawEncounterWorld() {
+  const enc = state.encounter;
+  if (!enc) return;
+  const zoom = BATTLE_ZOOM * state.battleZoomMul;
+  background(20);
+  const half = BATTLE_LEVEL_SIZE * 0.5;
+  const cell = BATTLE_LEVEL_SIZE / 20;
+
+  stroke(40);
+  strokeWeight(1);
+  noFill();
+  for (let i = 0; i <= 20; i++) {
+    const t = -half + cell * i;
+    const hA = battleWorldToScreen(enc, -half, t);
+    const hB = battleWorldToScreen(enc, half, t);
+    line(hA.x, hA.y, hB.x, hB.y);
+    const vA = battleWorldToScreen(enc, t, -half);
+    const vB = battleWorldToScreen(enc, t, half);
+    line(vA.x, vA.y, vB.x, vB.y);
+  }
+
+  stroke(110);
+  strokeWeight(2);
+  const tl = battleWorldToScreen(enc, -half, -half);
+  const br = battleWorldToScreen(enc, half, half);
+  rectMode(CORNERS);
+  noFill();
+  rect(tl.x, tl.y, br.x, br.y);
+
+  noStroke();
+  for (const e of enc.entities.values()) {
+    const p = battleWorldToScreen(enc, e.x, e.y);
+    fill(e.color[0], e.color[1], e.color[2]);
+    rectMode(CENTER);
+    rect(p.x, p.y, e.w * zoom, e.h * zoom);
+    if (e.health) {
+      const frac = max(0, e.health.current / e.health.max);
+      fill(0);
+      rect(p.x, p.y - e.h * zoom * 0.8, e.w * zoom * 0.9, 5);
+      fill(255, 0, 0);
+      rect(p.x - e.w * zoom * 0.45 * (1 - frac), p.y - e.h * zoom * 0.8, e.w * zoom * 0.9 * frac, 5);
+    }
+  }
+}
+
+function drawEncounterHud() {
+  const enc = state.encounter;
+  if (!enc) return;
+  const pe = encounterPlayerEntity(enc);
+
+  push();
+  rectMode(CORNER);
+  textAlign(LEFT, TOP);
+  noStroke();
+  fill(255);
+  textSize(14);
+  text("ENCOUNTER INSTANCE", 12, 10);
+  text(`danger ${(enc.danger * 100).toFixed(0)}% | enemies ${Array.from(enc.entities.values()).filter((e) => e.team === TEAM_ENEMIES && !e.projectile).length}`, 12, 28);
+  text("WASD move | Q/E spell | Hold LMB cast", 12, 46);
+
+  if (pe && pe.health && pe.caster) {
+    const barW = 220, barH = 16;
+    fill(0); rect(16, height - 30, barW, barH);
+    fill(220, 40, 40); rect(16, height - 30, barW * (pe.health.current / pe.health.max), barH);
+    fill(0); rect(width - 16 - barW, height - 30, barW, barH);
+    fill(40, 120, 255); rect(width - 16 - barW, height - 30, barW * (pe.caster.mana / pe.caster.manaMax), barH);
+    fill(255);
+    textAlign(LEFT, BOTTOM);
+    text(`HP ${pe.health.current.toFixed(1)} / ${pe.health.max.toFixed(0)}`, 16, height - 34);
+    textAlign(RIGHT, BOTTOM);
+    text(`Mana ${pe.caster.mana.toFixed(1)} / ${pe.caster.manaMax.toFixed(0)}`, width - 16, height - 34);
+    textAlign(CENTER, BOTTOM);
+    const curSpell = state.player.spells[pe.player.spellCursor] || "(no spell)";
+    text(`${curSpell} | gold ${state.player.gold}`, width * 0.5, height - 8);
+  }
+  drawMessageToast();
+  pop();
+}
+
+function drawMessageToast() {
+  if (state.messageTimer <= 0) return;
+  rectMode(CORNER);
+  const margin = 12;
+  const w = min(680, width - margin * 2);
+  const h = 54;
+  const x = margin;
+  const y = height - h - margin;
+  noStroke();
+  fill(30, 25, 55, 220);
+  rect(x, y, w, h, 8);
+  fill(240);
+  textAlign(LEFT, TOP);
+  textSize(16);
+  text(state.message, x + 12, y + 11, w - 24, h - 8);
+}
+
+function setup() {
+  createCanvas(windowWidth, windowHeight);
+  generateMap();
+}
+
+function draw() {
+  const dt = min(deltaTime / 1000, 0.05);
+  state.worldTime += dt;
+  if (state.messageTimer > 0) state.messageTimer -= dt;
+
+  if (state.mode === "overworld") {
+    if (state.player) updateTravel(dt);
+    drawWorld();
+    drawHud();
+    drawEncounterReportModal();
+  } else if (state.mode === "transition_to_encounter") {
+    updateEncounterTransition(dt);
+  } else if (state.mode === "transition_to_overworld") {
+    updateReturnToOverworldTransition(dt);
+  } else {
+    const scaledDt = dt * state.encounterTimeScale;
+    updateEncounter(scaledDt);
+    if (state.mode === "encounter") {
+      drawEncounterWorld();
+      drawEncounterHud();
+      state.encounterTimeScale = min(1, state.encounterTimeScale + dt * 0.42);
+    }
+  }
+
+  state.input.keyDownEvents.clear();
+  state.input.lmbDown = false;
+  state.input.lmbUp = false;
+}
+
+function mousePressed() {
+  state.input.heldLMB = true;
+  state.input.lmbDown = true;
+  if (state.mode !== "overworld") return;
+  if (state.postEncounterReport) {
+    state.postEncounterReport = null;
+    return;
+  }
+  for (const b of state.uiButtons) {
+    const inside = mouseX >= b.x && mouseX <= b.x + b.w && mouseY >= b.y && mouseY <= b.y + b.h;
+    if (inside) {
+      tryBuy(b.kind);
+      return;
+    }
+  }
+  onWorldClick(mouseX, mouseY);
+}
+
+function mouseReleased() {
+  state.input.heldLMB = false;
+  state.input.lmbUp = true;
+}
+
+function keyPressed() {
+  const k = key.toLowerCase();
+  state.input.heldKeys.add(k);
+  state.input.keyDownEvents.add(k);
+
+  if (state.mode !== "overworld") return;
+  if (state.postEncounterReport && (k === " " || k === "enter" || k === "escape")) {
+    state.postEncounterReport = null;
+    return;
+  }
+  if (k === "r") generateMap();
+  else if (k === "p" && state.player && state.player.potions > 0) {
+    state.player.potions -= 1;
+    state.player.mana = min(state.player.manaMax, state.player.mana + 35);
+    setMessage("Used mana potion.");
+  } else if (k === "e") {
+    state.encountersEnabled = !state.encountersEnabled;
+    setMessage(`Encounters ${state.encountersEnabled ? "enabled" : "disabled"}.`);
+  }
+}
+
+function keyReleased() {
+  state.input.heldKeys.delete(key.toLowerCase());
+}
+
+function windowResized() {
+  resizeCanvas(windowWidth, windowHeight);
+}
+</script>
+</body>
+</html>
