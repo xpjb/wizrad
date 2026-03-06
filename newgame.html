@@ -24,14 +24,23 @@ const GRID_CELL = 90;
 const GRID_JITTER = 0.34;
 const ROAD_NEIGHBORS = 3;
 const PLAYER_SPEED = 160;
-const ENCOUNTER_RATE = 0.22;
 const CAMERA_ZOOM = 3.45;
-const TERRAIN_TILE = 2;
 
-const BATTLE_LEVEL_SIZE = 40;
+const BATTLE_LEVEL_SIZE = 56;
 const BATTLE_ZOOM = 34;
+const ENCOUNTER_WORLD_UNITS = 1.0;
 const TEAM_PLAYER = 0;
 const TEAM_ENEMIES = 1;
+const EVIL_SITE_THRESHOLD = 0.5;
+const EVIL_SITE_MIN_DIST = GRID_CELL * 6;
+const SAFE_START_DANGER_MAX = 0.18;
+const EVIL_SITE_TYPES = [
+  { name: "Cave", emoji: "🕳️" },
+  { name: "Haunted House", emoji: "🏚️" },
+  { name: "Crypt", emoji: "🪦" },
+  { name: "Cult Shrine", emoji: "🕯️" },
+  { name: "Blighted Tower", emoji: "🗼" }
+];
 
 const SPELL_POOL = [
   "Missile", "Pulse", "Fireball", "Healing", "Homing", "Water",
@@ -50,7 +59,6 @@ const TOWN_TIERS = [
 const state = {
   terrainSeed: 0,
   dangerSeed: 0,
-  terrainLayer: null,
   towns: [],
   edges: [],
   edgeSet: new Set(),
@@ -63,6 +71,7 @@ const state = {
   encounter: null,
   worldTime: 0,
   nextEncounterAt: 0,
+  terrainRenderer: null,
   camera: { x: null, y: null, lastFrame: -1 },
   cameraZoomMul: 1,
   battleZoomMul: 1,
@@ -90,6 +99,34 @@ function easeInOutCubic(t) {
   const x = constrain(t, 0, 1);
   return x < 0.5 ? 4 * x * x * x : 1 - Math.pow(-2 * x + 2, 3) / 2;
 }
+function u32(n) { return n >>> 0; }
+function hash2u32(ix, iy, seed) {
+  let h = u32(Math.imul(ix, 374761393) + Math.imul(iy, 668265263) + Math.imul(seed, 1442695041));
+  h = u32(h ^ (h >>> 13));
+  h = u32(Math.imul(h, 1274126177));
+  return u32(h ^ (h >>> 16));
+}
+function smooth01(t) { return t * t * (3 - 2 * t); }
+function valueNoise2D(x, y, scale, seed) {
+  const px = x * scale;
+  const py = y * scale;
+  const x0 = Math.floor(px);
+  const y0 = Math.floor(py);
+  const x1 = x0 + 1;
+  const y1 = y0 + 1;
+  const tx = px - x0;
+  const ty = py - y0;
+  const sx = smooth01(tx);
+  const sy = smooth01(ty);
+  const v00 = hash2u32(x0, y0, seed) / 4294967295;
+  const v10 = hash2u32(x1, y0, seed) / 4294967295;
+  const v01 = hash2u32(x0, y1, seed) / 4294967295;
+  const v11 = hash2u32(x1, y1, seed) / 4294967295;
+  const nx0 = lerp(v00, v10, sx);
+  const nx1 = lerp(v01, v11, sx);
+  // Quantize to reduce tiny CPU/GPU drift and keep parity.
+  return Math.round(lerp(nx0, nx1, sy) * 65535) / 65535;
+}
 function vRot(a, r) {
   const c = Math.cos(r), s = Math.sin(r);
   return v(a.x * c - a.y * s, a.x * s + a.y * c);
@@ -100,13 +137,14 @@ function makeTownName() {
 }
 
 function terrainHeightAt(x, y) {
-  const n = noise(x * TERRAIN_SCALE + state.terrainSeed, y * TERRAIN_SCALE + state.terrainSeed * 0.7);
-  const ridge = noise(x * TERRAIN_SCALE * 0.6 + 300, y * TERRAIN_SCALE * 0.6 + 900);
+  const n = valueNoise2D(x + 300.123, y + 700.51, TERRAIN_SCALE, state.terrainSeed);
+  const ridge = valueNoise2D(x + 1300.7, y + 910.2, TERRAIN_SCALE * 0.6, state.terrainSeed ^ 0x9e3779b9);
   return constrain(n * 0.75 + ridge * 0.25, 0, 1);
 }
 
 function dangerAt(x, y) {
-  return noise(x * DANGER_SCALE + state.dangerSeed, y * DANGER_SCALE + state.dangerSeed * 1.17);
+  const d = valueNoise2D(x + 90.37, y + 190.13, DANGER_SCALE, state.dangerSeed);
+  return d * d;
 }
 
 function isLand(x, y) {
@@ -153,30 +191,163 @@ function screenToWorld(sx, sy) {
   };
 }
 
-function makeTerrainLayer() {
-  const g = createGraphics(WORLD_W, WORLD_H);
-  g.noStroke();
-  for (let y = 0; y < WORLD_H; y += TERRAIN_TILE) {
-    for (let x = 0; x < WORLD_W; x += TERRAIN_TILE) {
-      const h = terrainHeightAt(x, y);
-      if (h < SEA_LEVEL) {
-        g.fill(20, 35 + h * 20, 110 + h * 70);
-      } else if (h < SEA_LEVEL + BEACH_BAND) {
-        g.fill(214, 194, 132);
-      } else if (h < 0.8) {
-        const t = map(h, SEA_LEVEL + BEACH_BAND, 0.8, 0, 1, true);
-        g.fill(48 + t * 26, 124 + t * 46, 56 + t * 20);
-      } else if (h < 0.92) {
-        const t = map(h, 0.8, 0.92, 0, 1, true);
-        g.fill(112 + t * 36, 112 + t * 36, 112 + t * 36);
-      } else {
-        const t = map(h, 0.92, 1, 0, 1, true);
-        g.fill(230 + t * 22, 230 + t * 22, 236 + t * 19);
-      }
-      g.rect(x, y, TERRAIN_TILE, TERRAIN_TILE);
-    }
+function createTerrainRenderer() {
+  const canvas = document.createElement("canvas");
+  canvas.style.position = "fixed";
+  canvas.style.left = "0";
+  canvas.style.top = "0";
+  canvas.style.width = "100%";
+  canvas.style.height = "100%";
+  canvas.style.zIndex = "0";
+  canvas.style.pointerEvents = "none";
+  document.body.appendChild(canvas);
+
+  const gl = canvas.getContext("webgl2", { alpha: false, antialias: false, depth: false, stencil: false });
+  if (!gl) throw new Error("WebGL2 is required.");
+
+  const vertSrc = `#version 300 es
+precision highp float;
+const vec2 POS[3] = vec2[3](vec2(-1.0, -1.0), vec2(3.0, -1.0), vec2(-1.0, 3.0));
+void main() {
+  gl_Position = vec4(POS[gl_VertexID], 0.0, 1.0);
+}`;
+
+  const fragSrc = `#version 300 es
+precision highp float;
+precision highp int;
+out vec4 outColor;
+uniform vec2 uResolution;
+uniform vec2 uWorldSize;
+uniform vec2 uCamCenter;
+uniform float uCamScale;
+uniform uint uTerrainSeed;
+uniform uint uDangerSeed;
+uniform float uSeaLevel;
+uniform float uBeachBand;
+
+uint hash2u(uvec2 p, uint seed) {
+  uint h = p.x * 374761393u + p.y * 668265263u + seed * 1442695041u;
+  h ^= (h >> 13);
+  h *= 1274126177u;
+  h ^= (h >> 16);
+  return h;
+}
+float smooth01(float t) {
+  return t * t * (3.0 - 2.0 * t);
+}
+float valueNoise(vec2 p, float scale, uint seed) {
+  vec2 q = p * scale;
+  ivec2 i0 = ivec2(floor(q));
+  ivec2 i1 = i0 + ivec2(1);
+  vec2 f = fract(q);
+  float sx = smooth01(f.x);
+  float sy = smooth01(f.y);
+  // Mirror JS semantics: signed lattice coords are reinterpreted as uint bits.
+  float v00 = float(hash2u(uvec2(i0), seed)) * (1.0 / 4294967295.0);
+  float v10 = float(hash2u(uvec2(ivec2(i1.x, i0.y)), seed)) * (1.0 / 4294967295.0);
+  float v01 = float(hash2u(uvec2(ivec2(i0.x, i1.y)), seed)) * (1.0 / 4294967295.0);
+  float v11 = float(hash2u(uvec2(i1), seed)) * (1.0 / 4294967295.0);
+  float nx0 = mix(v00, v10, sx);
+  float nx1 = mix(v01, v11, sx);
+  float n = mix(nx0, nx1, sy);
+  return floor(n * 65535.0 + 0.5) / 65535.0;
+}
+float terrainHeightAt(vec2 world) {
+  float n = valueNoise(world + vec2(300.123, 700.51), ${TERRAIN_SCALE.toFixed(10)}, uTerrainSeed);
+  float ridge = valueNoise(world + vec2(1300.7, 910.2), ${(TERRAIN_SCALE * 0.6).toFixed(10)}, uTerrainSeed ^ 0x9e3779b9u);
+  return clamp(n * 0.75 + ridge * 0.25, 0.0, 1.0);
+}
+float dangerAt(vec2 world) {
+  return valueNoise(world + vec2(90.37, 190.13), ${DANGER_SCALE.toFixed(10)}, uDangerSeed);
+}
+void main() {
+  vec2 screen = vec2(gl_FragCoord.x, uResolution.y - gl_FragCoord.y);
+  vec2 world = uCamCenter + (screen - 0.5 * uResolution) / uCamScale;
+  world = clamp(world, vec2(0.0), uWorldSize);
+  float h = terrainHeightAt(world);
+  vec3 col;
+  if (h < uSeaLevel) {
+    col = vec3(20.0, 35.0 + h * 20.0, 110.0 + h * 70.0) / 255.0;
+  } else if (h < uSeaLevel + uBeachBand) {
+    col = vec3(214.0, 194.0, 132.0) / 255.0;
+  } else if (h < 0.8) {
+    float t = clamp((h - (uSeaLevel + uBeachBand)) / (0.8 - (uSeaLevel + uBeachBand)), 0.0, 1.0);
+    col = vec3(48.0 + t * 26.0, 124.0 + t * 46.0, 56.0 + t * 20.0) / 255.0;
+  } else if (h < 0.92) {
+    float t = clamp((h - 0.8) / (0.92 - 0.8), 0.0, 1.0);
+    col = vec3(112.0 + t * 36.0) / 255.0;
+  } else {
+    float t = clamp((h - 0.92) / 0.08, 0.0, 1.0);
+    col = vec3(230.0 + t * 22.0, 230.0 + t * 22.0, 236.0 + t * 19.0) / 255.0;
   }
-  return g;
+  outColor = vec4(col, 1.0);
+}`;
+
+  function compile(type, src) {
+    const shader = gl.createShader(type);
+    gl.shaderSource(shader, src);
+    gl.compileShader(shader);
+    if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+      const msg = gl.getShaderInfoLog(shader) || "shader compile error";
+      gl.deleteShader(shader);
+      throw new Error(msg);
+    }
+    return shader;
+  }
+
+  const vs = compile(gl.VERTEX_SHADER, vertSrc);
+  const fs = compile(gl.FRAGMENT_SHADER, fragSrc);
+  const program = gl.createProgram();
+  gl.attachShader(program, vs);
+  gl.attachShader(program, fs);
+  gl.linkProgram(program);
+  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+    throw new Error(gl.getProgramInfoLog(program) || "program link error");
+  }
+  gl.deleteShader(vs);
+  gl.deleteShader(fs);
+  return {
+    canvas,
+    gl,
+    program,
+    uResolution: gl.getUniformLocation(program, "uResolution"),
+    uWorldSize: gl.getUniformLocation(program, "uWorldSize"),
+    uCamCenter: gl.getUniformLocation(program, "uCamCenter"),
+    uCamScale: gl.getUniformLocation(program, "uCamScale"),
+    uTerrainSeed: gl.getUniformLocation(program, "uTerrainSeed"),
+    uDangerSeed: gl.getUniformLocation(program, "uDangerSeed"),
+    uSeaLevel: gl.getUniformLocation(program, "uSeaLevel"),
+    uBeachBand: gl.getUniformLocation(program, "uBeachBand")
+  };
+}
+
+function resizeTerrainRenderer() {
+  const tr = state.terrainRenderer;
+  const dpr = window.devicePixelRatio || 1;
+  const w = Math.max(1, Math.floor(window.innerWidth * dpr));
+  const h = Math.max(1, Math.floor(window.innerHeight * dpr));
+  if (tr.canvas.width !== w || tr.canvas.height !== h) {
+    tr.canvas.width = w;
+    tr.canvas.height = h;
+  }
+}
+
+function renderTerrainRenderer(camCenterX, camCenterY, camScaleCss) {
+  const tr = state.terrainRenderer;
+  resizeTerrainRenderer();
+  const gl = tr.gl;
+  gl.viewport(0, 0, tr.canvas.width, tr.canvas.height);
+  gl.useProgram(tr.program);
+  gl.uniform2f(tr.uResolution, tr.canvas.width, tr.canvas.height);
+  gl.uniform2f(tr.uWorldSize, WORLD_W, WORLD_H);
+  gl.uniform2f(tr.uCamCenter, camCenterX, camCenterY);
+  gl.uniform1f(tr.uCamScale, camScaleCss * (tr.canvas.width / max(window.innerWidth, 1)));
+  gl.uniform1ui(tr.uTerrainSeed, state.terrainSeed >>> 0);
+  gl.uniform1ui(tr.uDangerSeed, state.dangerSeed >>> 0);
+  gl.uniform1f(tr.uSeaLevel, SEA_LEVEL);
+  gl.uniform1f(tr.uBeachBand, BEACH_BAND);
+  gl.disable(gl.BLEND);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
 }
 
 function makeTownMeta() {
@@ -215,10 +386,9 @@ function addEdge(i, j) {
 }
 
 function generateMap() {
-  noiseSeed(floor(random(1e9)));
   randomSeed(floor(random(1e9)));
-  state.terrainSeed = random(10, 5000);
-  state.dangerSeed = random(20, 7000);
+  state.terrainSeed = floor(random(1, 0xffffffff)) >>> 0;
+  state.dangerSeed = floor(random(1, 0xffffffff)) >>> 0;
   state.towns = [];
   state.edges = [];
   state.edgeSet.clear();
@@ -250,50 +420,144 @@ function generateMap() {
         sizeTier: meta.sizeTier,
         emoji: meta.emoji,
         population: meta.population,
+        isEvilSite: false,
+        siteType: null,
+        siteEmoji: null,
+        siteDanger: dangerAt(x, y),
+        siteCleared: false,
         visited: false,
         shopSpell: null
       });
     }
   }
 
-  for (let i = 0; i < state.towns.length; i++) {
-    const a = state.towns[i];
-    const sorted = [];
-    for (let j = 0; j < state.towns.length; j++) {
-      if (i === j) continue;
-      const b = state.towns[j];
-      const cellDx = abs(a.gx - b.gx);
-      const cellDy = abs(a.gy - b.gy);
-      if (cellDx > 1 || cellDy > 1) continue;
-      sorted.push({ j, d: dist(a.x, a.y, b.x, b.y) });
+  // Evil sites: keep them in high-danger regions, but spaced apart.
+  const highDanger = state.towns
+    .filter((t) => t.siteDanger > EVIL_SITE_THRESHOLD)
+    .sort((a, b) => b.siteDanger - a.siteDanger);
+  const chosenEvil = [];
+  for (const t of highDanger) {
+    let tooClose = false;
+    for (const s of chosenEvil) {
+      if (dist(t.x, t.y, s.x, s.y) < EVIL_SITE_MIN_DIST) {
+        tooClose = true;
+        break;
+      }
     }
-    sorted.sort((u, v2) => u.d - v2.d);
-    for (let n = 0; n < min(ROAD_NEIGHBORS, sorted.length); n++) {
-      const j = sorted[n].j;
-      if (lineLandFraction(a, state.towns[j]) >= 0.65) addEdge(i, j);
-    }
+    if (tooClose) continue;
+    chosenEvil.push(t);
+    const evilType = random(EVIL_SITE_TYPES);
+    t.isEvilSite = true;
+    t.siteType = evilType.name;
+    t.siteEmoji = evilType.emoji;
+    t.siteCleared = false;
   }
 
+  function isGabrielEdge(i, j) {
+    const a = state.towns[i];
+    const b = state.towns[j];
+    const mx = (a.x + b.x) * 0.5;
+    const my = (a.y + b.y) * 0.5;
+    const r2 = sq(a.x - b.x) * 0.25 + sq(a.y - b.y) * 0.25;
+    const eps = 1e-4;
+    for (let k = 0; k < state.towns.length; k++) {
+      if (k === i || k === j) continue;
+      const t = state.towns[k];
+      const d2 = sq(t.x - mx) + sq(t.y - my);
+      if (d2 < r2 - eps) return false;
+    }
+    return true;
+  }
+
+  const nearest = new Array(state.towns.length).fill(-1);
   for (let i = 0; i < state.towns.length; i++) {
-    const connected = state.edges.some((e) => e.a === i || e.b === i);
-    if (connected) continue;
+    const a = state.towns[i];
     let best = -1;
     let bestD = Infinity;
     for (let j = 0; j < state.towns.length; j++) {
       if (i === j) continue;
-      const a = state.towns[i];
       const b = state.towns[j];
       if (abs(a.gx - b.gx) > 2 || abs(a.gy - b.gy) > 2) continue;
       const d = dist(a.x, a.y, b.x, b.y);
-      if (d < bestD && lineLandFraction(a, b) >= 0.55) {
+      if (d < bestD && lineLandFraction(a, b) >= 0.65) {
         bestD = d;
         best = j;
+      }
+    }
+    nearest[i] = best;
+  }
+
+  // Mutual nearest-neighbor edges filtered by Gabriel criterion (subset of Delaunay edges).
+  for (let i = 0; i < state.towns.length; i++) {
+    const j = nearest[i];
+    if (j < 0) continue;
+    if (nearest[j] === i && isGabrielEdge(i, j)) addEdge(i, j);
+  }
+
+  // Add a few extra local Gabriel neighbors for better connectivity.
+  for (let i = 0; i < state.towns.length; i++) {
+    const a = state.towns[i];
+    const local = [];
+    for (let j = 0; j < state.towns.length; j++) {
+      if (i === j) continue;
+      const b = state.towns[j];
+      if (abs(a.gx - b.gx) > 2 || abs(a.gy - b.gy) > 2) continue;
+      const d = dist(a.x, a.y, b.x, b.y);
+      local.push({ j, d });
+    }
+    local.sort((u, v2) => u.d - v2.d);
+    let added = 0;
+    for (const c of local) {
+      if (added >= ROAD_NEIGHBORS) break;
+      if (!isGabrielEdge(i, c.j)) continue;
+      if (lineLandFraction(a, state.towns[c.j]) < 0.65) continue;
+      addEdge(i, c.j);
+      added++;
+    }
+  }
+
+  // Keep every town connected with the closest valid local Gabriel-like edge.
+  for (let i = 0; i < state.towns.length; i++) {
+    const connected = state.edges.some((e) => e.a === i || e.b === i);
+    if (connected) continue;
+    const a = state.towns[i];
+    let best = -1;
+    let bestD = Infinity;
+    for (let j = 0; j < state.towns.length; j++) {
+      if (i === j) continue;
+      const b = state.towns[j];
+      if (abs(a.gx - b.gx) > 2 || abs(a.gy - b.gy) > 2) continue;
+      const d = dist(a.x, a.y, b.x, b.y);
+      if (d < bestD && lineLandFraction(a, b) >= 0.55 && isGabrielEdge(i, j)) {
+        best = j;
+        bestD = d;
+      }
+    }
+    // Last-resort safety net: keep graph connected if no Gabriel local edge exists.
+    if (best < 0) {
+      for (let j = 0; j < state.towns.length; j++) {
+        if (i === j) continue;
+        const b = state.towns[j];
+        if (abs(a.gx - b.gx) > 2 || abs(a.gy - b.gy) > 2) continue;
+        const d = dist(a.x, a.y, b.x, b.y);
+        if (d < bestD && lineLandFraction(a, b) >= 0.55) {
+          best = j;
+          bestD = d;
+        }
       }
     }
     if (best >= 0) addEdge(i, best);
   }
 
-  state.terrainLayer = makeTerrainLayer();
+  // Road sanity check: Gabriel edges are guaranteed Delaunay-subgraph edges.
+  let nonGabrielCount = 0;
+  for (const e of state.edges) {
+    if (!isGabrielEdge(e.a, e.b)) nonGabrielCount++;
+  }
+  if (nonGabrielCount > 0) {
+    console.warn(`Road check: ${nonGabrielCount}/${state.edges.length} edges are fallback (non-Gabriel).`);
+  }
+
   initPlayer();
 }
 
@@ -302,18 +566,38 @@ function initPlayer() {
     state.player = null;
     return;
   }
-  let startIdx = 0;
+  let startIdx = -1;
   let bestD = Infinity;
   const cx = WORLD_W * 0.5;
   const cy = WORLD_H * 0.5;
+  // Prefer low-danger, non-evil, central starts.
   for (let i = 0; i < state.towns.length; i++) {
     const t = state.towns[i];
+    if (t.isEvilSite) continue;
+    if (t.siteDanger > SAFE_START_DANGER_MAX) continue;
     const d = dist(t.x, t.y, cx, cy);
     if (d < bestD) {
       bestD = d;
       startIdx = i;
     }
   }
+
+  if (startIdx < 0) {
+    // Fallback: choose least-danger non-evil town nearest to center.
+    let bestScore = Infinity;
+    for (let i = 0; i < state.towns.length; i++) {
+      const t = state.towns[i];
+      if (t.isEvilSite) continue;
+      const centerD = dist(t.x, t.y, cx, cy);
+      const score = t.siteDanger * 1200 + centerD;
+      if (score < bestScore) {
+        bestScore = score;
+        startIdx = i;
+      }
+    }
+  }
+
+  if (startIdx < 0) startIdx = 0;
 
   state.towns[startIdx].visited = true;
   state.player = {
@@ -369,13 +653,24 @@ function arriveTown() {
   const town = state.towns[p.atTown];
   town.visited = true;
   prepareTownShop(p.atTown);
+  if (town.isEvilSite && !town.siteCleared) {
+    beginEncounterTransition(max(town.siteDanger, 0.65), {
+      label: `${town.siteType} encounter`,
+      budgetMult: 2.6,
+      bonusGold: floor(60 + town.siteDanger * 120),
+      bonusMana: floor(25 + town.siteDanger * 25),
+      siteTownId: town.id
+    });
+    setMessage(`You entered a ${town.siteType} near ${town.name}.`);
+    return;
+  }
   setMessage(`Arrived at ${town.name}. Shop is open.`);
 }
 
 function maybeStartEncounter(danger) {
   if (!state.encountersEnabled) return false;
   if (state.worldTime < state.nextEncounterAt) return false;
-  if (random() < ENCOUNTER_RATE * danger * (deltaTime / 1000)) {
+  if (random() < danger * (deltaTime / 1000)) {
     beginEncounterTransition(danger);
     return true;
   }
@@ -409,15 +704,14 @@ function updateTravel(dt) {
 }
 
 function drawWorld() {
-  background(10, 14, 18);
+  clear();
   const cam = getCamera();
+  renderTerrainRenderer(cam.cx, cam.cy, cam.scale);
 
   push();
   translate(width * 0.5, height * 0.5);
   scale(cam.scale);
   translate(-cam.cx, -cam.cy);
-  image(state.terrainLayer, 0, 0, WORLD_W, WORLD_H);
-
   strokeWeight(2 / cam.scale);
   const playerTown = state.player ? state.player.atTown : -1;
   for (const e of state.edges) {
@@ -446,12 +740,18 @@ function drawWorld() {
   textAlign(CENTER, CENTER);
   for (const town of state.towns) {
     const s = worldToScreen(town.x, town.y);
+    const icon = town.isEvilSite ? town.siteEmoji : town.emoji;
     noStroke();
     textSize(72);
-    text(town.emoji, s.x, s.y - 6);
+    text(icon, s.x, s.y - 6);
     fill(15);
     textSize(13);
     text(town.name, s.x, s.y + 18);
+    if (town.isEvilSite) {
+      fill(town.siteCleared ? color(160, 240, 170) : color(255, 120, 120));
+      textSize(11);
+      text(`${town.siteType}${town.siteCleared ? " (cleared)" : ""}`, s.x, s.y + 33);
+    }
     if (state.player && town.id === state.player.atTown && state.player.targetTown == null) {
       fill(255, 245, 145);
       textSize(12);
@@ -589,7 +889,8 @@ function makeEntity() {
     id: -1, x: 0, y: 0, w: 1, h: 1, vx: 0, vy: 0,
     team: null, color: [255, 255, 255], mass: 1,
     health: null, caster: null, player: null, ai: null, aiCaster: null, projectile: null,
-    expiry: null, meleeDamage: 0, meleeCooldown: 0.6, nextMeleeAt: 0
+    expiry: null, meleeDamage: 0, meleeCooldown: 0.6, nextMeleeAt: 0,
+    sprite: null
   };
 }
 
@@ -616,6 +917,7 @@ function makeEncounterPlayer(overworldPlayer) {
   e.h = 1;
   e.team = TEAM_PLAYER;
   e.color = [255, 60, 255];
+  e.sprite = "🧙";
   e.player = { speed: 10, spellCursor: overworldPlayer.spellCursor };
   e.caster = { manaMax: overworldPlayer.manaMax, mana: overworldPlayer.mana, manaRegen: 14, lastCast: -999 };
   e.health = { max: overworldPlayer.hpMax, current: overworldPlayer.hp, regen: 0.35 };
@@ -633,6 +935,7 @@ function makeZerg(pos) {
   e.meleeDamage = 14;
   e.meleeCooldown = 0.65;
   e.enemyType = "Zerg";
+  e.sprite = "🐀";
   return e;
 }
 
@@ -647,6 +950,7 @@ function makeMissileCaster(pos) {
   e.aiCaster = { spell: "Missile", range: 11 };
   e.caster = { manaMax: 26, mana: 26, manaRegen: 5, lastCast: -999 };
   e.enemyType = "Missile Caster";
+  e.sprite = "🧿";
   return e;
 }
 
@@ -661,6 +965,7 @@ function makeBloodcaster(pos) {
   e.aiCaster = { spell: "Lifesteal", range: 8 };
   e.caster = { manaMax: 999, mana: 999, manaRegen: 0, lastCast: -999 };
   e.enemyType = "Bloodcaster";
+  e.sprite = "🩸";
   return e;
 }
 
@@ -675,6 +980,7 @@ function makeBarrager(pos) {
   e.aiCaster = { spell: "Barrage", range: 16 };
   e.caster = { manaMax: 50, mana: 50, manaRegen: 6, lastCast: -999 };
   e.enemyType = "Barrager";
+  e.sprite = "💀";
   return e;
 }
 
@@ -689,10 +995,11 @@ function makeSummoner(pos) {
   e.aiCaster = { spell: "SummonRushers", range: 13 };
   e.caster = { manaMax: 45, mana: 45, manaRegen: 4, lastCast: -999 };
   e.enemyType = "Summoner";
+  e.sprite = "🧛";
   return e;
 }
 
-function createEncounter(danger) {
+function createEncounter(danger, options = null) {
   const p = state.player;
   const enc = {
     t: 0,
@@ -703,17 +1010,21 @@ function createEncounter(danger) {
     enemyRoster: {},
     startGold: p.gold,
     startHp: p.hp,
-    startMana: p.mana
+    startMana: p.mana,
+    originWorldX: p.x,
+    originWorldY: p.y,
+    special: options || null
   };
   encounterAddEntity(enc, makeEncounterPlayer(p));
-  spawnEncounterEnemies(enc, danger);
+  spawnEncounterEnemies(enc, danger, options?.budgetMult || 1);
   state.encounter = enc;
   state.encounterTimeScale = 0.18;
   state.battleZoomMul = 1.22;
-  setMessage(`Encounter! Danger ${(danger * 100).toFixed(0)}%`);
+  const label = options?.label || "Encounter";
+  setMessage(`${label}! Danger ${(danger * 100).toFixed(0)}%`);
 }
 
-function beginEncounterTransition(danger) {
+function beginEncounterTransition(danger, options = null) {
   if (state.mode !== "overworld") return;
   state.mode = "transition_to_encounter";
   state.transition = {
@@ -721,7 +1032,8 @@ function beginEncounterTransition(danger) {
     t: 0,
     outDuration: 0.8,
     inDuration: 0.9,
-    danger
+    danger,
+    options
   };
 }
 
@@ -745,7 +1057,7 @@ function updateEncounterTransition(dt) {
     drawHud();
     drawBlackOverlay(Math.pow(p, 1.05) * 255);
     if (p >= 1) {
-      createEncounter(tr.danger);
+      createEncounter(tr.danger, tr.options || null);
       tr.phase = "in";
       tr.t = 0;
       state.cameraZoomMul = 1;
@@ -804,8 +1116,8 @@ function updateReturnToOverworldTransition(dt) {
   }
 }
 
-function spawnEncounterEnemies(enc, danger) {
-  let budget = 4 + floor(danger * 15);
+function spawnEncounterEnemies(enc, danger, budgetMult = 1) {
+  let budget = max(1, floor((4 + danger * 15) * budgetMult));
   const half = BATTLE_LEVEL_SIZE * 0.5 - 2.5;
   const spawnNearEdge = () => {
     const edge = floor(random(4));
@@ -864,7 +1176,7 @@ function drawEncounterReportModal() {
   text("Encounter Report", x + 18, y + 14);
 
   textSize(15);
-  text(`Outcome: ${rep.outcome}    Danger: ${rep.dangerPct}%`, x + 18, y + 52, panelW - 36, 24);
+  text(`Outcome: ${rep.outcome}    Type: ${rep.type}    Danger: ${rep.dangerPct}%`, x + 18, y + 52, panelW - 36, 24);
   text(`Gold: ${formatSigned(rep.goldDelta)}    HP: ${formatSigned(rep.hpDelta)}    Mana: ${formatSigned(rep.manaDelta)}`, x + 18, y + 84, panelW - 36, 24);
 
   textSize(16);
@@ -1223,11 +1535,18 @@ function endEncounter(victory) {
   if (!state.encounter || !state.player) return;
   const enc = state.encounter;
   const danger = enc.danger;
+  const special = enc.special;
   if (victory) {
     const reward = floor(6 + danger * 24 + random(0, 8));
-    state.player.gold += reward;
-    state.player.mana = min(state.player.manaMax, state.player.mana + 10 + danger * 15);
-    setMessage(`Encounter won! +${reward}g`);
+    const bonusGold = special?.bonusGold || 0;
+    const bonusMana = special?.bonusMana || 0;
+    state.player.gold += reward + bonusGold;
+    state.player.mana = min(state.player.manaMax, state.player.mana + 10 + danger * 15 + bonusMana);
+    if (special?.siteTownId != null) {
+      const t = state.towns[special.siteTownId];
+      if (t) t.siteCleared = true;
+    }
+    setMessage(`Encounter won! +${reward + bonusGold}g`);
   } else {
     const loss = floor(8 + danger * 20);
     state.player.gold = max(0, state.player.gold - loss);
@@ -1245,6 +1564,7 @@ function endEncounter(victory) {
     .map(([name, count]) => `${name} x${count}`);
   state.pendingEncounterReport = {
     outcome: victory ? "Victory" : "Defeat",
+    type: special?.label || "Roaming encounter",
     dangerPct: (danger * 100).toFixed(0),
     enemies: enemyLines,
     goldDelta: state.player.gold - enc.startGold,
@@ -1265,24 +1585,15 @@ function drawEncounterWorld() {
   const enc = state.encounter;
   if (!enc) return;
   const zoom = BATTLE_ZOOM * state.battleZoomMul;
-  background(20);
+  const cam = battleCamera(enc);
+  const terrainCenterX = enc.originWorldX + cam.cx * ENCOUNTER_WORLD_UNITS;
+  const terrainCenterY = enc.originWorldY + cam.cy * ENCOUNTER_WORLD_UNITS;
+  const terrainScaleCss = zoom / ENCOUNTER_WORLD_UNITS;
+  clear();
+  renderTerrainRenderer(terrainCenterX, terrainCenterY, terrainScaleCss);
   const half = BATTLE_LEVEL_SIZE * 0.5;
-  const cell = BATTLE_LEVEL_SIZE / 20;
 
-  stroke(40);
-  strokeWeight(1);
-  noFill();
-  for (let i = 0; i <= 20; i++) {
-    const t = -half + cell * i;
-    const hA = battleWorldToScreen(enc, -half, t);
-    const hB = battleWorldToScreen(enc, half, t);
-    line(hA.x, hA.y, hB.x, hB.y);
-    const vA = battleWorldToScreen(enc, t, -half);
-    const vB = battleWorldToScreen(enc, t, half);
-    line(vA.x, vA.y, vB.x, vB.y);
-  }
-
-  stroke(110);
+  stroke(110, 150);
   strokeWeight(2);
   const tl = battleWorldToScreen(enc, -half, -half);
   const br = battleWorldToScreen(enc, half, half);
@@ -1291,12 +1602,21 @@ function drawEncounterWorld() {
   rect(tl.x, tl.y, br.x, br.y);
 
   noStroke();
+  rectMode(CENTER);
   for (const e of enc.entities.values()) {
     const p = battleWorldToScreen(enc, e.x, e.y);
-    fill(e.color[0], e.color[1], e.color[2]);
-    rectMode(CENTER);
-    rect(p.x, p.y, e.w * zoom, e.h * zoom);
+    if (e.sprite && !e.projectile) {
+      fill(255);
+      textAlign(CENTER, CENTER);
+      textSize(max(18, min(64, e.h * zoom * 1.25)));
+      text(e.sprite, p.x, p.y - 1);
+    } else {
+      fill(e.color[0], e.color[1], e.color[2]);
+      rectMode(CENTER);
+      rect(p.x, p.y, e.w * zoom, e.h * zoom);
+    }
     if (e.health) {
+      rectMode(CENTER);
       const frac = max(0, e.health.current / e.health.max);
       fill(0);
       rect(p.x, p.y - e.h * zoom * 0.8, e.w * zoom * 0.9, 5);
@@ -1358,7 +1678,13 @@ function drawMessageToast() {
 }
 
 function setup() {
-  createCanvas(windowWidth, windowHeight);
+  const main = createCanvas(windowWidth, windowHeight);
+  main.style("position", "fixed");
+  main.style("left", "0px");
+  main.style("top", "0px");
+  main.style("z-index", "1");
+  main.style("pointer-events", "auto");
+  state.terrainRenderer = createTerrainRenderer();
   generateMap();
 }
 
@@ -1441,6 +1767,7 @@ function keyReleased() {
 
 function windowResized() {
   resizeCanvas(windowWidth, windowHeight);
+  resizeTerrainRenderer();
 }
 </script>
 </body>
